@@ -8,3 +8,19 @@
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Resource-Policy: same-origin
   X-Robots-Tag: noindex, nofollow
+
+# Connection test page only (sync preparation): the global policy above is removed and
+# replaced by one that also allows the two Google API hosts. The app itself keeps connect-src 'none'.
+# These rules must stay below "/*": matching rules are applied in file order.
+# /connect-test.html is answered with a redirect to /connect-test, so both paths are listed.
+/connect-test
+  ! Content-Security-Policy
+  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src https://sheets.googleapis.com https://www.googleapis.com; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+
+/connect-test.html
+  ! Content-Security-Policy
+  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src https://sheets.googleapis.com https://www.googleapis.com; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+
+/js/connect-test*
+  ! Content-Security-Policy
+  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src https://sheets.googleapis.com https://www.googleapis.com; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'

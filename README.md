@@ -25,6 +25,7 @@ A personal task list that runs entirely in the browser. All data stays on the de
 - リンクは `http://` と `https://` だけを保存し、`noopener noreferrer` で開きます
 - 読み込むファイルは形式と版を確かめ、合わなければ1件も書き換えません。読み込みの直前の状態は自動で控えます
 - サーバー側の処理や外から呼べる窓口（API）がない静的なサイトなので、呼び出し回数の制限（レート制限）は入れていません
+- 例外は接続テスト用のページ [`/connect-test.html`](public/connect-test.html) だけです（同期の準備・試験用）。このページに限り、Google の `www.googleapis.com` と `sheets.googleapis.com` への通信を許可しています（`public/_headers` でこのページだけ CSP を差し替え）。ログインは Google の画面へ移動する方式（部品の読み込みなし）、権限は `drive.file`（このアプリが作ったファイルだけ）。送るのはテスト用の行だけで、アプリのタスクやメモは送りません。クライアントIDはコードに書かず、使う人が画面で貼ります
 
 ## 手元で動かす
 

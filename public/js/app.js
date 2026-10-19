@@ -2008,6 +2008,14 @@ async function restoreBackup(b) {
   return replaceAllData(r.data, U.fmtDateTime(b.at) + ' の控えに戻しました');
 }
 
+/** Leave for the connection test page only after every queued save has been written. */
+async function openConnectTest(e) {
+  e.preventDefault();
+  saveGoals.flush();
+  await S.queue;
+  location.assign('/connect-test.html');
+}
+
 function openSettings() {
   const body = h('div', { class: 'settings' });
   const sheet = openSheet({ title: '設定', content: body, cancelLabel: null, onDone: () => true, doneLabel: '完了' });
@@ -2078,7 +2086,9 @@ function openSettings() {
         h('li', {}, h('button', { type: 'button', class: 'action', onclick: () => openGoalReview(S.ui.goalSeg) }, icon('target'), '目標のふり返り'))),
 
       h('div', { class: 'group-head' }, h('span', { class: 'group-label' }, 'このアプリについて')),
-      h('p', { class: 'sub-note' }, '実行リスト v1.1。データはこの端末のブラウザの中（IndexedDB）にだけ保存されます。外部への送信はしません。PCとスマホは別々の帳簿です（引っ越しは 書き出す → 読み込む）。'));
+      h('p', { class: 'sub-note' }, '実行リスト v1.2。データはこの端末のブラウザの中（IndexedDB）にだけ保存されます。外部への送信はしません。PCとスマホは別々の帳簿です（引っ越しは 書き出す → 読み込む）。'),
+      h('ul', { class: 'card form' }, h('li', {}, h('a', { class: 'action', href: '/connect-test.html', onclick: openConnectTest }, icon('world'), '接続テスト（同期の準備）'))),
+      h('p', { class: 'sub-note' }, 'PCとスマホの同期の準備として、Googleとつながるかを試すページです。そのページだけがGoogleと通信します。タスクやメモは送りません。'));
     renderBackups();
     renderStorage();
   }

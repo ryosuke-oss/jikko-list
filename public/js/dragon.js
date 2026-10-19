@@ -1,7 +1,10 @@
 // The dragon: experience points, stages and the shapes it is drawn with.
+// The points are not added up as they come: they are counted again from the tasks every time
+// (completions, route steps that earned points, tasks added per day), so two devices that did
+// the same thing end up with the same number, and removing a task never takes points away.
 
 export const XP_RULES = {
-  add: 1, // adding a task (max addPerDay times a day)
+  add: 1, // adding a task (max addPerDay a day, by the date in Japan time)
   addPerDay: 10,
   A: 20,
   B: 10,
@@ -9,7 +12,12 @@ export const XP_RULES = {
   none: 5, // completing a task without a rank
   onTime: 3, // completed on or before the due date
   step: 2, // a route step done for the first time
+  stepMax: 5, // route steps that can earn points per task
 };
+
+// settings.xpModel: 2 = points counted from the records (version 1.3 and later).
+export const XP_MODEL = 2;
+const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
 
 export const STAGES = [
   { min: 0, name: 'たまご' },
@@ -65,32 +73,58 @@ export function xpForCompletion(task, today) {
   return { amount: base + onTime, bucket, base, onTime };
 }
 
+/** 'YYYY-MM-DD' of an ISO time in Japan time (UTC+9, no daylight saving), or '' when it is not a time. */
+export function jstDate(iso) {
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return '';
+  return new Date(ms + JST_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+/** Route steps of a task that earned points: their ids plus the ones moved over from version 1.2 as a plain count. */
+export function stepPoints(task) {
+  const n = (Array.isArray(task.xpSteps) ? task.xpSteps.length : 0) + (task.xpStepsLegacy || 0);
+  return Math.min(XP_RULES.stepMax, n);
+}
+
 /**
- * Add (or with a negative delta, take back) points.
- * Returns how much really changed and the stage it evolved to (-1 when it did not evolve).
+ * Points counted from the tasks (in the trash and completely deleted ones included):
+ * 1. completed tasks: the points recorded when they were completed, under their rank
+ * 2. route steps that earned points (at most stepMax per task) x 2, under "other"
+ * 3. tasks added per day in Japan time, at most addPerDay a day x 1, under "other"
  */
-export function grant(dragon, bucket, delta, reason, at) {
-  const key = BUCKETS.includes(bucket) ? bucket : 'other';
-  const before = totalOf(dragon);
-  const next = Math.max(0, (dragon.xp[key] || 0) + delta);
-  const applied = next - (dragon.xp[key] || 0);
-  dragon.xp[key] = next;
+export function countXp(tasks) {
+  const xp = { A: 0, B: 0, C: 0, other: 0 };
+  const perDay = new Map();
+  for (const t of tasks) {
+    if (t.status === 'done' && t.xpGiven > 0) xp[BUCKETS.includes(t.xpBucket) ? t.xpBucket : 'other'] += t.xpGiven;
+    xp.other += stepPoints(t) * XP_RULES.step;
+    const day = jstDate(t.createdAt);
+    if (day) perDay.set(day, (perDay.get(day) || 0) + 1);
+  }
+  for (const n of perDay.values()) xp.other += Math.min(n, XP_RULES.addPerDay) * XP_RULES.add;
+  return xp;
+}
+
+/**
+ * Count the points again and keep the result on the dragon.
+ * With a reason, every change is written to the recent list ("最近の経験値") of this device.
+ * Returns how much the total moved and the stage it evolved to (-1 when it did not evolve).
+ */
+export function settle(dragon, tasks, reason, at) {
+  const prev = Object.assign({ A: 0, B: 0, C: 0, other: 0 }, dragon.xp);
+  const before = BUCKETS.reduce((sum, k) => sum + (prev[k] || 0), 0);
+  dragon.xp = countXp(tasks);
   dragon.total = totalOf(dragon);
-  if (applied !== 0) {
-    dragon.log.push({ at, delta: applied, reason, bucket: key });
+  if (reason) {
+    for (const k of BUCKETS) {
+      const delta = dragon.xp[k] - (prev[k] || 0);
+      if (delta !== 0) dragon.log.push({ at, delta, reason, bucket: k });
+    }
     if (dragon.log.length > LOG_MAX) dragon.log.splice(0, dragon.log.length - LOG_MAX);
   }
   const s0 = stageIndex(before);
   const s1 = stageIndex(dragon.total);
-  return { applied, before, after: dragon.total, evolvedTo: s1 > s0 ? s1 : -1 };
-}
-
-/** +1 for adding a task, at most addPerDay times a day. */
-export function grantAdd(dragon, today, at) {
-  if (!dragon.addCount || dragon.addCount.date !== today) dragon.addCount = { date: today, count: 0 };
-  if (dragon.addCount.count >= XP_RULES.addPerDay) return { applied: 0, evolvedTo: -1 };
-  dragon.addCount.count += 1;
-  return grant(dragon, 'other', XP_RULES.add, '追加', at);
+  return { applied: dragon.total - before, before, after: dragon.total, evolvedTo: s1 > s0 ? s1 : -1 };
 }
 
 // ---- Shapes (same outlines as the first mock-up; colors follow the white design) ----

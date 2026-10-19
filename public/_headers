@@ -1,5 +1,5 @@
 /*
-  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; worker-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
   X-Content-Type-Options: nosniff
   X-Frame-Options: DENY
   Referrer-Policy: no-referrer
@@ -9,8 +9,13 @@
   Cross-Origin-Resource-Policy: same-origin
   X-Robots-Tag: noindex, nofollow
 
+# The service worker is checked on every visit, so a new version is found at once.
+/sw.js
+  Cache-Control: no-cache
+
 # Connection test page only (sync preparation): the global policy above is removed and
-# replaced by one that also allows the two Google API hosts. The app itself keeps connect-src 'none'.
+# replaced by one that also allows the two Google API hosts. The app itself only talks to its own site
+# ('self': the service worker keeping the app's files on the device).
 # These rules must stay below "/*": matching rules are applied in file order.
 # /connect-test.html is answered with a redirect to /connect-test, so both paths are listed.
 /connect-test

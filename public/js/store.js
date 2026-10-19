@@ -3,16 +3,19 @@
 // a broken or foreign file from overwriting anything.
 
 import { isYmd, isIsoTime, clampText, cleanUrl } from './util.js';
-import { newDragon, BUCKETS } from './dragon.js';
+import { newDragon, BUCKETS, XP_MODEL } from './dragon.js';
 import {
   RANKS, DURATIONS, STATUSES, KINDS, STEP_STATES, GROUPS, PERSON_ICONS,
   TITLE_MAX, NOTE_MAX, ROUTE_MAX, MEMO_MAX, NEXT_MAX, PERSON_NAME_MAX,
+  PURGED_TASK_TITLE, PURGED_MEMO_TEXT,
   defaultPeople, initialOf,
 } from './tasks.js';
 import { newGoals, newSchedule, GOAL_KINDS, GOAL_LIMITS, SCHEDULE_LIMITS } from './plan.js';
 
 export const DB_NAME = 'jikko-list';
-export const DB_VERSION = 1;
+// 2 (app 1.3): no new stores. Raising the number makes tabs of older versions close the database and
+// ask for a reload, so they can no longer write data in the old shape (they would drop the new fields).
+export const DB_VERSION = 2;
 export const APP_ID = 'jikko-list';
 export const FORMAT = 1;
 export const KEYS = ['tasks', 'people', 'memos', 'goals', 'goalLog', 'schedule', 'scheduleLog', 'dragon', 'settings'];
@@ -30,7 +33,7 @@ export function newState(today, at) {
     schedule: newSchedule(today),
     scheduleLog: [],
     dragon: newDragon(),
-    settings: { version: 1, createdAt: at, lastExportAt: null, persisted: null, persistAsked: false },
+    settings: { version: 1, createdAt: at, lastExportAt: null, persisted: null, persistAsked: false, xpModel: XP_MODEL },
   };
 }
 
@@ -87,11 +90,28 @@ function cleanLinks(l) {
   return { slack: cleanUrl(o.slack) || '', doc: cleanUrl(o.doc) || '', web: cleanUrl(o.web) || '' };
 }
 
+/**
+ * Route steps that earned points. Version 1.3 keeps their ids (xpSteps); version 1.2 and older kept only
+ * a count (stepXpCount): the done steps still in the route give their ids and the rest stays a plain count.
+ */
+function cleanXpSteps(t, steps) {
+  if (Array.isArray(t.xpSteps)) {
+    const ids = [...new Set(t.xpSteps.filter((x) => typeof x === 'string' && x && x.length <= 100))].slice(0, ROUTE_MAX);
+    const legacy = Math.min(ROUTE_MAX - ids.length, Math.max(0, Math.floor(num(t.xpStepsLegacy))));
+    return { ids, legacy };
+  }
+  const count = Math.min(ROUTE_MAX, Math.max(0, Math.floor(num(t.stepXpCount))));
+  const ids = steps.filter((s) => s.xpGiven).map((s) => s.id).slice(0, count);
+  return { ids, legacy: count - ids.length };
+}
+
 export function cleanTask(t) {
   if (!isObj(t)) fail('タスクが壊れています');
-  const title = typeof t.title === 'string' ? clampText(t.title.trim(), TITLE_MAX) : '';
+  const purgedAt = isoOrNull(t.purgedAt);
+  const title = (typeof t.title === 'string' ? clampText(t.title.trim(), TITLE_MAX) : '') || (purgedAt ? PURGED_TASK_TITLE : '');
   if (!title) fail('タスク名のないタスクがあります');
-  const route = t.route == null ? [] : arr(t.route, '確認ルート');
+  const route = (t.route == null ? [] : arr(t.route, '確認ルート')).slice(0, ROUTE_MAX).map(cleanStep);
+  const xpSteps = cleanXpSteps(t, route);
   return {
     id: idOf(t.id, 'タスク'),
     title,
@@ -103,7 +123,7 @@ export function cleanTask(t) {
     nextAction: str(t.nextAction, NEXT_MAX),
     memo: str(t.memo, MEMO_MAX),
     cOption: bool(t.cOption),
-    route: route.slice(0, ROUTE_MAX).map(cleanStep),
+    route,
     links: cleanLinks(t.links),
     parked: bool(t.parked),
     returnOn: ymdOrNull(t.returnOn),
@@ -112,12 +132,15 @@ export function cleanTask(t) {
     createdAt: isoOrNull(t.createdAt) || EPOCH,
     updatedAt: isoOrNull(t.updatedAt) || EPOCH,
     doneAt: isoOrNull(t.doneAt),
-    deletedAt: isoOrNull(t.deletedAt),
+    deletedAt: isoOrNull(t.deletedAt) || purgedAt, // a mark is always in the trash too
     xpGiven: Math.max(0, num(t.xpGiven)),
     xpBucket: oneOf(t.xpBucket, BUCKETS),
     prevStatus: oneOf(t.prevStatus, STATUSES),
     prevPark: isObj(t.prevPark) ? { returnOn: ymdOrNull(t.prevPark.returnOn) } : null,
-    stepXpCount: Math.min(ROUTE_MAX, Math.max(0, Math.floor(num(t.stepXpCount)))),
+    xpSteps: xpSteps.ids,
+    xpStepsLegacy: xpSteps.legacy,
+    stepXpCount: Math.min(ROUTE_MAX, xpSteps.ids.length + xpSteps.legacy), // kept for version 1.2 and older
+    purgedAt,
   };
 }
 
@@ -137,14 +160,16 @@ export function cleanPerson(p) {
 
 export function cleanMemo(m) {
   if (!isObj(m)) fail('メモが壊れています');
-  const text = str(m.text, MEMO_TEXT_MAX).trim();
+  const purgedAt = isoOrNull(m.purgedAt);
+  const text = str(m.text, MEMO_TEXT_MAX).trim() || (purgedAt ? PURGED_MEMO_TEXT : '');
   if (!text) fail('空のメモがあります');
   return {
     id: idOf(m.id, 'メモ'),
     text,
     createdAt: isoOrNull(m.createdAt) || EPOCH,
     taskId: typeof m.taskId === 'string' && m.taskId ? m.taskId.slice(0, 100) : null,
-    deletedAt: isoOrNull(m.deletedAt),
+    deletedAt: isoOrNull(m.deletedAt) || purgedAt,
+    purgedAt,
   };
 }
 
@@ -222,6 +247,7 @@ function cleanSettings(s) {
     lastExportAt: isoOrNull(o.lastExportAt),
     persisted: typeof o.persisted === 'boolean' ? o.persisted : null,
     persistAsked: bool(o.persistAsked),
+    xpModel: o.xpModel === XP_MODEL ? XP_MODEL : 1,
   };
 }
 
@@ -252,7 +278,7 @@ export function countsOf(data) {
   return {
     tasks: live.filter((t) => t.status !== 'done').length,
     done: live.filter((t) => t.status === 'done').length,
-    trash: data.tasks.length - live.length,
+    trash: data.tasks.filter((t) => t.deletedAt && !t.purgedAt).length,
     memos: data.memos.filter((m) => !m.deletedAt).length,
     people: data.people.filter((p) => !p.deletedAt).length,
     goals: data.goals.week.lines.length + data.goals.month.lines.length + data.goals.year.lines.length,

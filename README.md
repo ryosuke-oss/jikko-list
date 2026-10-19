@@ -14,13 +14,14 @@ A personal task list that runs entirely in the browser. All data stays on the de
 - 今日の予定（今日だけの箇条書き）と目標（週・月・年）。期間が終わると自動で履歴へ移り、消えない
 - メモ帳（→ でタスクにする）、竜の育成（経験値と5段階の姿）
 - 書き出し（JSON）・読み込み・1日1回の自動の控え（7日分）・ゴミ箱
+- 電波がなくても開ける：アプリの部品（HTML・CSS・JS・アイコン）を Service Worker でこの端末にしまっておく（[`public/sw.js`](public/sw.js)）。新しい版は、編集中でないときに自動で入れ替わる（設定に「いまの版」と［更新］）
 - PC は3列、タブレットは2列、スマホは1列＋下のタブバー。どの幅でも横スクロールなし
 
 ## データとセキュリティ
 
 - **データはこの端末のブラウザの中（IndexedDB）にだけ保存します。** サーバーへの送信、解析、広告、Cookie はありません
 - 外部のファイル（CDN・Webフォント）を読み込みません。部品もアイコンも同じ場所から配信します
-- `Content-Security-Policy`（`default-src 'none'`・`connect-src 'none'`）などのヘッダーで、外部との通信やページの埋め込みを止めています（[`public/_headers`](public/_headers)）
+- `Content-Security-Policy`（`default-src 'none'`・`connect-src 'self'`・`worker-src 'self'`）などのヘッダーで、外部との通信やページの埋め込みを止めています（[`public/_headers`](public/_headers)）。`'self'` は、自分のサイトの部品を端末にしまう Service Worker のためだけです
 - 画面は `textContent` / `createElement` だけで組み立てます。`innerHTML` と `eval` は使いません
 - リンクは `http://` と `https://` だけを保存し、`noopener noreferrer` で開きます
 - 読み込むファイルは形式と版を確かめ、合わなければ1件も書き換えません。読み込みの直前の状態は自動で控えます
@@ -46,6 +47,12 @@ Node.js 20 以上。1行の解釈・状態の連動・経験値の計算・期�
 ## 公開
 
 `main` に push すると、Cloudflare Workers Builds が [`wrangler.jsonc`](wrangler.jsonc) の設定で `public/` フォルダだけを公開します。
+
+`public/` の中を変えたら、push の前に次を実行します。Service Worker がしまう部品の一覧と版（中身から作る印）を `public/sw.js` に書き直します。忘れると `npm test` が失敗します（古い部品が端末に残り続けるのを防ぐため）。
+
+```bash
+npm run stamp
+```
 
 ## 使っている部品
 

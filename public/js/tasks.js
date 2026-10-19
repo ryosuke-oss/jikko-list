@@ -1,7 +1,7 @@
 // Tasks, the route of confirmations/requests, status linkage, lists and filters.
 
 import { uid, diffDays, mondayOf, addDays, fmtMD, clampText } from './util.js';
-import { xpForCompletion, grant, XP_RULES } from './dragon.js';
+import { xpForCompletion, XP_RULES } from './dragon.js';
 import { TITLE_MAX, NOTE_MAX, ROUTE_MAX } from './parse.js';
 
 export { TITLE_MAX, NOTE_MAX, ROUTE_MAX };
@@ -91,7 +91,10 @@ export function newTask(fields, at, order) {
     xpBucket: null,
     prevStatus: null,
     prevPark: null,
+    xpSteps: [],
+    xpStepsLegacy: 0,
     stepXpCount: 0,
+    purgedAt: null,
   };
 }
 
@@ -142,19 +145,37 @@ export function allStepsDone(task) {
 }
 
 /**
- * Steps that became done for the first time: flags them and returns the points (+2 each).
+ * Steps that became done for the first time: flags them, records their ids and returns the points (+2 each).
  * At most ROUTE_MAX steps per task ever earn points, so adding and deleting steps cannot pad the total.
+ * The ids are kept even when the step is deleted later, and the same step counts once.
  */
+/**
+ * Join the steps that earned points from another copy of the same task (another tab saved it meanwhile):
+ * earned points never drop, a step is counted once and at most ROUTE_MAX per task.
+ */
+export function keepXpSteps(task, other) {
+  const legacy = Math.max(task.xpStepsLegacy || 0, (other && other.xpStepsLegacy) || 0);
+  const ids = [...new Set([...(task.xpSteps || []), ...((other && other.xpSteps) || [])])].slice(0, Math.max(0, ROUTE_MAX - legacy));
+  task.xpSteps = ids;
+  task.xpStepsLegacy = legacy;
+  task.stepXpCount = Math.min(ROUTE_MAX, ids.length + legacy);
+}
+
 export function collectStepXp(task) {
-  const used = task.stepXpCount || 0;
+  const ids = new Set(Array.isArray(task.xpSteps) ? task.xpSteps : []);
+  const legacy = task.xpStepsLegacy || 0;
   let n = 0;
   for (const s of task.route) {
     if (s.state === 'done' && !s.xpGiven) {
       s.xpGiven = true;
-      if (used + n < ROUTE_MAX) n += 1;
+      if (!ids.has(s.id) && ids.size + legacy < ROUTE_MAX) {
+        ids.add(s.id);
+        n += 1;
+      }
     }
   }
-  task.stepXpCount = used + n;
+  task.xpSteps = [...ids];
+  task.stepXpCount = Math.min(ROUTE_MAX, ids.size + legacy); // kept for version 1.2 and older
   return n * XP_RULES.step;
 }
 
@@ -223,9 +244,9 @@ export const SMART_LISTS = [
   { key: 'parked', label: 'あとで箱', icon: 'archive', color: 'brown' },
 ];
 
-/** Not deleted and not done. */
+/** Not deleted (nor completely deleted) and not done. */
 export function isLive(t) {
-  return !t.deletedAt && t.status !== 'done';
+  return !t.deletedAt && !t.purgedAt && t.status !== 'done';
 }
 
 export function inSmart(key, t, today) {
@@ -318,21 +339,39 @@ export function renumber(tasks) {
   tasks.slice().sort(byOrder).forEach((t, i) => { t.order = i; });
 }
 
+const ORDER_GAP_MIN = 0.000001;
+
 /**
- * The user dragged rows into a new order (ids = the visible rows, top to bottom).
- * Rows that are hidden by the current list or filter keep their places.
+ * The user dragged one row (movedId) to a new place (ids = the visible rows, top to bottom, after the drag).
+ * Only the moved row gets a new number: halfway between the visible rows right above and below it,
+ * or one less than the top / one more than the bottom. Only when the two numbers are too close
+ * are all tasks numbered again first (rare). Returns the ids of the tasks whose number changed.
  */
-export function applyReorder(tasks, ids) {
-  renumber(tasks);
+export function applyReorder(tasks, ids, movedId, at) {
   const byId = new Map(tasks.map((t) => [t.id, t]));
-  const items = ids.map((id) => byId.get(id)).filter(Boolean);
-  const slots = items.map((t) => t.order).sort((a, b) => a - b);
-  items.forEach((t, i) => { t.order = slots[i]; });
+  const k = ids.indexOf(movedId);
+  const moved = byId.get(movedId);
+  if (k < 0 || !moved) return [];
+  const above = k > 0 ? byId.get(ids[k - 1]) : null;
+  const below = k < ids.length - 1 ? byId.get(ids[k + 1]) : null;
+  if (!above && !below) return [];
+  const changed = new Set([moved.id]);
+  if (above && below && !(below.order - above.order >= ORDER_GAP_MIN)) {
+    const before = new Map(tasks.map((t) => [t.id, t.order]));
+    renumber(tasks);
+    for (const t of tasks) if (t.order !== before.get(t.id)) changed.add(t.id);
+  }
+  if (above && below) moved.order = (above.order + below.order) / 2;
+  else if (above) moved.order = above.order + 1;
+  else moved.order = below.order - 1;
+  if (at) moved.updatedAt = at;
+  return [...changed];
 }
 
 // ---- Done / undo ----
+// The task records what its completion is worth; the dragon counts it (dragon.js settle).
 
-export function completeTask(task, dragon, today, at) {
+export function completeTask(task, today, at) {
   if (task.status === 'done') return null;
   task.prevStatus = task.status;
   task.prevPark = task.parked ? { returnOn: task.returnOn || null } : null;
@@ -342,18 +381,16 @@ export function completeTask(task, dragon, today, at) {
   task.returnOn = null;
   task.returnedMark = false;
   const x = xpForCompletion(task, today);
-  const g = grant(dragon, x.bucket, x.amount, '完了', at);
-  task.xpGiven = g.applied;
+  task.xpGiven = x.amount;
   task.xpBucket = x.bucket;
   task.updatedAt = at;
-  return { amount: g.applied, bucket: x.bucket, onTime: x.onTime, evolvedTo: g.evolvedTo };
+  return { amount: x.amount, bucket: x.bucket, onTime: x.onTime };
 }
 
-/** Undo a completion: the points that were given are taken back. */
-export function uncompleteTask(task, dragon, at) {
+/** Undo a completion: the points it was worth are no longer counted. */
+export function uncompleteTask(task, at) {
   if (task.status !== 'done') return null;
   const amount = task.xpGiven || 0;
-  const g = amount ? grant(dragon, task.xpBucket || 'other', -amount, '完了の取り消し', at) : { applied: 0 };
   task.status = task.prevStatus && task.prevStatus !== 'done' ? task.prevStatus : 'todo';
   task.prevStatus = null;
   if (task.prevPark) {
@@ -366,7 +403,7 @@ export function uncompleteTask(task, dragon, at) {
   task.xpGiven = 0;
   task.xpBucket = null;
   task.updatedAt = at;
-  return { amount: g.applied };
+  return { amount: -amount };
 }
 
 // ---- The "later" box ----
@@ -410,9 +447,52 @@ export function trashTask(task, at) {
   task.updatedAt = at;
 }
 
+/** Back from the trash. A completely deleted task (a mark) never comes back. */
 export function restoreTask(task, at) {
+  if (task.purgedAt) return false;
   task.deletedAt = null;
   task.updatedAt = at;
+  return true;
+}
+
+export const PURGED_TASK_TITLE = '（消したタスク）';
+export const PURGED_MEMO_TEXT = '（消したメモ）';
+
+export function isPurged(x) {
+  return Boolean(x && x.purgedAt);
+}
+
+/**
+ * "完全に消す": the task stays as a small mark so that other devices learn it is gone and the
+ * dragon's points do not drop. Only the id, the dates, the status and the points-related fields are kept;
+ * the name, memo, links and route are cleared. It is never shown in any list, count or search.
+ */
+export function purgeTask(task, at) {
+  Object.assign(task, {
+    title: PURGED_TASK_TITLE,
+    due: null,
+    duration: null,
+    star: false,
+    nextAction: '',
+    memo: '',
+    cOption: false,
+    route: [],
+    links: { slack: '', doc: '', web: '' },
+    parked: false,
+    returnOn: null,
+    returnedMark: false,
+    doneAt: null,
+    prevStatus: null,
+    prevPark: null,
+    deletedAt: task.deletedAt || at,
+    purgedAt: at,
+    updatedAt: at,
+  });
+}
+
+/** The same for a memo: only the id and the dates are kept. */
+export function purgeMemo(memo, at) {
+  Object.assign(memo, { text: PURGED_MEMO_TEXT, taskId: null, deletedAt: memo.deletedAt || at, purgedAt: at });
 }
 
 /** The boss to suggest for an A task without a route ("①確認・上司（方向性確認）"). */

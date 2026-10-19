@@ -1,5 +1,6 @@
 // 実行リスト — start-up, screens and user actions.
-// Data lives only in this browser (IndexedDB). There is no network code in this app.
+// Data lives only in this browser (IndexedDB). The only network code is the service worker
+// (sw.js), which keeps this site's own files on the device so the app opens without a connection.
 
 import { h, icon, fill, shapesSvg, debounce, isPlainEnter } from './dom.js';
 import { openSheet, alertDialog, confirmDialog, pickFrom, toast, isPhone, overlayOpen } from './ui.js';
@@ -12,6 +13,8 @@ import * as ST from './store.js';
 
 const TAB_ID = U.uid();
 const UI_KEY = 'jikko-list.ui';
+// Shown in the settings. Changing it (or any file under public/) needs `npm run stamp` (tests check it).
+const APP_VERSION = 'v1.3';
 
 const S = {
   db: null,
@@ -27,6 +30,10 @@ const S = {
   sortables: {},
   highlight: null,
   iosBannerHidden: false,
+  sw: null, // service worker registration
+  swTimer: null,
+  reloadTimer: null,
+  reloading: false,
 };
 
 const C = {}; // components that are created once and re-filled
@@ -149,6 +156,7 @@ async function reloadFromDb() {
     console.error(e);
     return;
   }
+  D.settle(S.data.dragon, S.data.tasks, null, nowIso());
   renderAll();
 }
 
@@ -163,6 +171,7 @@ async function checkRev() {
 // ---------------------------------------------------------------- start-up
 
 async function start() {
+  setupServiceWorker();
   buildShell();
   try {
     S.db = await ST.openDb();
@@ -190,6 +199,7 @@ async function start() {
     }
   }
   setupChannel();
+  const recount = recountOnOpen();
   setupKeyboardInset();
   setupLayout();
   await dayCheck(true);
@@ -198,6 +208,103 @@ async function start() {
   document.getElementById('app').hidden = false;
   document.getElementById('boot').remove();
   if (performance.mark) performance.mark('jikko:ready'); // start-up time, readable in the browser tools
+  // shown a little later, so that it does not hide the start-up notices (e.g. tasks back from the later box)
+  if (recount) setTimeout(() => toast('竜の経験値を記録から数え直しました（前 ' + recount.before.toLocaleString() + ' → 今 ' + recount.after.toLocaleString() + '）', { duration: 8000 }), 3500);
+}
+
+/**
+ * The dragon's points are counted from the records (version 1.3). The first time this version opens
+ * on a device, the change is told once when the number moved.
+ */
+function recountOnOpen() {
+  const d = S.data;
+  const before = d.dragon.total;
+  D.settle(d.dragon, d.tasks, null, nowIso());
+  if (d.settings.xpModel === D.XP_MODEL) return null;
+  d.settings.xpModel = D.XP_MODEL;
+  save(['dragon', 'settings']);
+  return before !== d.dragon.total ? { before, after: d.dragon.total } : null;
+}
+
+// ---------------------------------------------------------------- offline (service worker)
+
+/** A sheet is open or something is being typed: the page must not be reloaded now. */
+function isEditing() {
+  if (overlayOpen()) return true;
+  const a = document.activeElement;
+  if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.isContentEditable)) return true;
+  // text typed into the add fields (quick add, memo, schedule) but not added yet
+  return [...document.querySelectorAll('.qa-input, .line-input')].some((el) => el.value.trim() !== '');
+}
+
+function setupServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  const sw = navigator.serviceWorker;
+  // A page without a worker is taken over quietly by the first one. After that, every change of worker
+  // (a new version, possibly started from another tab) reloads this page once nothing is being edited here.
+  let controlled = Boolean(sw.controller);
+  sw.addEventListener('controllerchange', () => {
+    if (!controlled) {
+      controlled = true;
+      return;
+    }
+    reloadWhenIdle();
+  });
+  sw.register('/sw.js').then((reg) => {
+    S.sw = reg;
+    const watch = (w) => {
+      if (w) w.addEventListener('statechange', () => { if (w.state === 'installed') updateWaiting(); });
+    };
+    if (reg.waiting) updateWaiting();
+    watch(reg.installing);
+    reg.addEventListener('updatefound', () => watch(reg.installing));
+  }).catch((e) => console.warn('service worker', e));
+}
+
+/** A new version is ready: it replaces the old one as soon as nothing is being edited. */
+function updateWaiting() {
+  if (!navigator.serviceWorker.controller || !S.sw || !S.sw.waiting) return;
+  if (applyUpdate(false)) return;
+  clearInterval(S.swTimer);
+  S.swTimer = setInterval(() => { if (applyUpdate(false)) clearInterval(S.swTimer); }, 10000);
+}
+
+function applyUpdate(force) {
+  const w = S.sw && S.sw.waiting;
+  if (!w || (!force && isEditing())) return false;
+  saveGoals.flush();
+  S.queue.then(() => w.postMessage({ type: 'skip-waiting' }));
+  return true;
+}
+
+/** The new version is in charge: reload once nothing is being edited and every save has been written. */
+function reloadWhenIdle() {
+  const attempt = async () => {
+    if (S.reloading || isEditing()) return;
+    S.reloading = true;
+    clearInterval(S.reloadTimer);
+    saveGoals.flush();
+    await S.queue;
+    location.reload();
+  };
+  if (!S.reloadTimer) S.reloadTimer = setInterval(attempt, 2000);
+  attempt();
+}
+
+function checkForUpdate() {
+  if (S.sw) S.sw.update().catch(() => { /* offline */ });
+}
+
+/** The version of the files this page was opened with ("v1.3-1a2b3c4d"), or null without a service worker. */
+function swVersion() {
+  return new Promise((resolve) => {
+    const c = navigator.serviceWorker && navigator.serviceWorker.controller;
+    if (!c) { resolve(null); return; }
+    const ch = new MessageChannel();
+    const timer = setTimeout(() => resolve(null), 1500);
+    ch.port1.onmessage = (e) => { clearTimeout(timer); resolve(e.data && e.data.version ? String(e.data.version) : null); };
+    c.postMessage({ type: 'version' }, [ch.port2]);
+  });
 }
 
 function fatal(title, detail) {
@@ -285,8 +392,8 @@ function setupKeyboardInset() {
 }
 
 function setupTimers() {
-  // Due labels and return dates are recalculated every hour while the app is open.
-  setInterval(() => { dayCheck(false); }, 60 * 60 * 1000);
+  // Due labels and return dates are recalculated every hour while the app is open (and a new version is looked for).
+  setInterval(() => { dayCheck(false); checkForUpdate(); }, 60 * 60 * 1000);
   const toMidnight = () => {
     const n = new Date();
     const next = new Date(n.getFullYear(), n.getMonth(), n.getDate() + 1, 0, 0, 5);
@@ -297,6 +404,7 @@ function setupTimers() {
     if (document.visibilityState !== 'visible') return;
     checkRev();
     dayCheck(false);
+    checkForUpdate();
   });
 }
 
@@ -666,7 +774,7 @@ function setupSortables() {
         document.documentElement.classList.remove('dragging');
         if (evt.to !== evt.from || evt.oldIndex === evt.newIndex) return;
         const ids = [...C.listUl.querySelectorAll('.row')].map((el) => el.dataset.id);
-        T.applyReorder(S.data.tasks, ids);
+        T.applyReorder(S.data.tasks, ids, evt.item.dataset.id, nowIso());
         save(['tasks']);
         renderList();
         if (S.layout === 'mobile') renderTodayTasks();
@@ -985,7 +1093,7 @@ function renderDragonFull(box) {
     h('div', { class: 'group-head' }, h('span', { class: 'group-label' }, '経験値の内わけ')),
     h('ul', { class: 'card kv' },
       [['A 考える', d.xp.A], ['B 調べればできる', d.xp.B], ['C 作業', d.xp.C], ['追加・確認ルートなど', d.xp.other]].map(([k, v]) => h('li', {}, h('span', {}, k), h('span', { class: 'kv-v' }, v.toLocaleString())))),
-    h('p', { class: 'sub-note' }, '追加 +1（1日10回まで）／C完了 +5／B完了 +10／A完了 +20／期日までに完了 +3／確認ルートの段を初めて済にする +2。完了を取り消すと、そのとき入った分が減ります。期限切れでは減りません。'),
+    h('p', { class: 'sub-note' }, '追加 +1（日本時間で1日10件まで）／C完了 +5／B完了 +10／A完了 +20／期日までに完了 +3／確認ルートの段を初めて済にする +2（1タスク5段まで）。経験値はタスクの記録から数えます。完了を取り消すと、その分が減ります。ゴミ箱に入れても、完全に消しても、期限切れでも減りません。'),
     recent.length ? h('div', { class: 'group-head' }, h('span', { class: 'group-label' }, '最近の経験値')) : null,
     recent.length ? h('ul', { class: 'card kv' }, recent.map((e) => h('li', {}, h('span', {}, e.reason + '　' + U.fmtDateTime(e.at)), h('span', { class: 'kv-v ' + (e.delta >= 0 ? 'plus' : 'minus') }, (e.delta >= 0 ? '+' : '') + e.delta)))) : null);
 }
@@ -1061,7 +1169,7 @@ function buildMemo() {
 function addMemo(text, batch) {
   const v = U.clampText(String(text).trim(), ST.MEMO_TEXT_MAX);
   if (!v) return;
-  S.data.memos.push({ id: U.uid(), text: v, createdAt: nowIso(), taskId: null, deletedAt: null });
+  S.data.memos.push({ id: U.uid(), text: v, createdAt: nowIso(), taskId: null, deletedAt: null, purgedAt: null });
   if (!batch) {
     C.memoInput.value = '';
     save(['memos']);
@@ -1073,7 +1181,7 @@ function addMemo(text, batch) {
 
 function renderMemo(fromAll) {
   if (fromAll && isEditingIn(C.memoUl)) return;
-  const memos = S.data.memos.filter((m) => !m.deletedAt);
+  const memos = S.data.memos.filter((m) => !m.deletedAt && !m.purgedAt);
   fill(C.memoUl, ...memos.map((m) => memoLine(m)));
   C.memoUl.hidden = memos.length === 0;
 }
@@ -1094,7 +1202,13 @@ function memoLine(m) {
     memo.deletedAt = nowIso();
     save(['memos']);
     renderMemo();
-    toast('メモをゴミ箱に移しました', { actionLabel: '元に戻す', onAction: () => { memo.deletedAt = null; save(['memos']); renderMemo(); }, duration: 5000 });
+    toast('メモをゴミ箱に移しました', { actionLabel: '元に戻す', onAction: () => {
+      const cur = S.data.memos.find((x) => x.id === m.id);
+      if (!cur || cur.purgedAt) return;
+      cur.deletedAt = null;
+      save(['memos']);
+      renderMemo();
+    }, duration: 5000 });
   } }, icon('x'));
   li.append(body, to, del);
   return li;
@@ -1285,7 +1399,7 @@ function addTask(p, memoId) {
   const at = nowIso();
   const t = T.newTask({ title: p.title, due: p.due, rank: p.rank, duration: p.duration, star: p.star, steps: p.steps }, at, T.nextOrder(S.data.tasks));
   S.data.tasks.push(t);
-  const g = D.grantAdd(S.data.dragon, S.today, at);
+  const g = D.settle(S.data.dragon, S.data.tasks, '追加', at);
   const keys = ['tasks', 'dragon'];
   if (memoId) {
     const m = S.data.memos.find((x) => x.id === memoId);
@@ -1296,7 +1410,7 @@ function addTask(p, memoId) {
   renderAll();
   const evo = g.evolvedTo >= 0 ? '　' + evolveText(g.evolvedTo) : '';
   const visible = T.inSmart(S.ui.smart, t, S.today) && T.matchFilters(S.filters, t, S.today);
-  toast('追加しました' + (g.applied ? '（竜 +1）' : '') + evo, visible || S.layout === 'mobile' ? undefined : {
+  toast('追加しました' + (g.applied > 0 ? '（竜 +' + g.applied + '）' : '') + evo, visible || S.layout === 'mobile' ? undefined : {
     actionLabel: '見る',
     onAction: () => { S.ui.smart = 'all'; S.filters = T.emptyFilters(); S.highlight = t.id; saveUi(); renderTiles(); renderList(); },
     duration: 5000,
@@ -1377,15 +1491,13 @@ function openBulkSheet(initial) {
 
 function addMany(list) {
   const at = nowIso();
-  let xp = 0;
-  let evolved = -1;
   for (const p of list) {
     const t = T.newTask({ title: p.title, due: p.due, rank: p.rank, duration: p.duration, star: p.star, steps: p.steps }, at, T.nextOrder(S.data.tasks));
     S.data.tasks.push(t);
-    const g = D.grantAdd(S.data.dragon, S.today, at);
-    xp += g.applied;
-    if (g.evolvedTo >= 0) evolved = g.evolvedTo;
   }
+  const g = D.settle(S.data.dragon, S.data.tasks, '追加', at);
+  const xp = g.applied;
+  const evolved = g.evolvedTo;
   save(['tasks', 'dragon']);
   renderAll();
   toast(list.length + '件追加しました' + (xp ? '（竜 +' + xp + '）' : '') + (evolved >= 0 ? '　' + evolveText(evolved) : ''));
@@ -1400,8 +1512,9 @@ function toggleDone(id) {
     undoComplete(id);
     return;
   }
-  const r = T.completeTask(t, S.data.dragon, S.today, nowIso());
-  if (!r) return;
+  const at = nowIso();
+  if (!T.completeTask(t, S.today, at)) return;
+  const r = D.settle(S.data.dragon, S.data.tasks, '完了', at);
   clearTimeout(S.recentlyDone.get(id));
   S.recentlyDone.set(id, setTimeout(() => {
     S.recentlyDone.delete(id);
@@ -1410,7 +1523,7 @@ function toggleDone(id) {
   }, 1500));
   save(['tasks', 'dragon']);
   renderAll();
-  toast('完了しました（竜 +' + r.amount + '）' + (r.evolvedTo >= 0 ? '　' + evolveText(r.evolvedTo) : ''), {
+  toast('完了しました（竜 +' + r.applied + '）' + (r.evolvedTo >= 0 ? '　' + evolveText(r.evolvedTo) : ''), {
     actionLabel: '元に戻す',
     onAction: () => undoComplete(id),
     duration: 5000,
@@ -1423,10 +1536,12 @@ function undoComplete(id) {
   if (!t || t.status !== 'done') return;
   clearTimeout(S.recentlyDone.get(id));
   S.recentlyDone.delete(id);
-  const r = T.uncompleteTask(t, S.data.dragon, nowIso());
+  const at = nowIso();
+  T.uncompleteTask(t, at);
+  const r = D.settle(S.data.dragon, S.data.tasks, '完了の取り消し', at);
   save(['tasks', 'dragon']);
   renderAll();
-  toast('元に戻しました' + (r.amount ? '（竜 ' + r.amount + '）' : ''));
+  toast('元に戻しました' + (r.applied ? '（竜 ' + r.applied + '）' : ''));
 }
 
 /** Ask for the return date. Resolves with null (none), 'YYYY-MM-DD', or undefined (cancelled). */
@@ -1775,6 +1890,7 @@ function commitDetail(id, w, statusBeforeDone) {
   const wantDone = w.status === 'done' && orig.status !== 'done';
   const wantUndone = orig.status === 'done' && w.status !== 'done';
   const finalStatus = w.status;
+  T.keepXpSteps(w, orig);
   const stepXp = T.collectStepXp(w);
   if (wantDone) w.status = statusBeforeDone && statusBeforeDone !== 'done' ? statusBeforeDone : 'doing';
   if (wantUndone) w.status = 'done';
@@ -1783,23 +1899,27 @@ function commitDetail(id, w, statusBeforeDone) {
   let msg = '保存しました';
   let evolved = -1;
   if (stepXp) {
-    const g = D.grant(S.data.dragon, 'other', stepXp, '確認ルート', at);
+    const g = D.settle(S.data.dragon, S.data.tasks, '確認ルート', at);
     msg += '（竜 +' + g.applied + '）';
     if (g.evolvedTo >= 0) evolved = g.evolvedTo;
+  } else if (!wantDone && !wantUndone) {
+    D.settle(S.data.dragon, S.data.tasks, '詳細の保存', at);
   }
   if (wantDone) {
-    const r = T.completeTask(w, S.data.dragon, S.today, at);
+    T.completeTask(w, S.today, at);
+    const r = D.settle(S.data.dragon, S.data.tasks, '完了', at);
     save(['tasks', 'dragon']);
     S.recentlyDone.set(id, setTimeout(() => { S.recentlyDone.delete(id); renderList(); if (S.layout === 'mobile') renderTodayTasks(); }, 1500));
     renderAll();
     if (r.evolvedTo >= 0) evolved = r.evolvedTo;
-    toast('完了しました（竜 +' + r.amount + (stepXp ? '・確認ルート +' + stepXp : '') + '）' + (evolved >= 0 ? '　' + evolveText(evolved) : ''), { actionLabel: '元に戻す', onAction: () => undoComplete(id), duration: 5000 });
+    toast('完了しました（竜 +' + r.applied + (stepXp ? '・確認ルート +' + stepXp : '') + '）' + (evolved >= 0 ? '　' + evolveText(evolved) : ''), { actionLabel: '元に戻す', onAction: () => undoComplete(id), duration: 5000 });
     if (evolved >= 0) hop();
     return true;
   }
   if (wantUndone) {
-    T.uncompleteTask(w, S.data.dragon, at);
+    T.uncompleteTask(w, at);
     w.status = finalStatus;
+    D.settle(S.data.dragon, S.data.tasks, '完了の取り消し', at);
   }
   save(['tasks', 'dragon']);
   renderAll();
@@ -1880,8 +2000,8 @@ function openDoneLog() {
 function openTrash() {
   const box = h('div');
   const render = () => {
-    const tasks = S.data.tasks.filter((t) => t.deletedAt).sort((a, b) => b.deletedAt.localeCompare(a.deletedAt));
-    const memos = S.data.memos.filter((m) => m.deletedAt).sort((a, b) => b.deletedAt.localeCompare(a.deletedAt));
+    const tasks = S.data.tasks.filter((t) => t.deletedAt && !t.purgedAt).sort((a, b) => b.deletedAt.localeCompare(a.deletedAt));
+    const memos = S.data.memos.filter((m) => m.deletedAt && !m.purgedAt).sort((a, b) => b.deletedAt.localeCompare(a.deletedAt));
     const item = (label, sub, onRestore, onPurge) => h('li', { class: 'trash-row' },
       h('div', { class: 'trash-main' }, h('div', { class: 'row-title-text' }, label), h('div', { class: 'row-meta' }, sub)),
       h('button', { type: 'button', class: 'mini-btn', onclick: onRestore }, '戻す'),
@@ -1896,12 +2016,29 @@ function openTrash() {
       h('p', { class: 'sheet-note' }, '削除したものはここに残ります。自動では消えません。'),
       h('div', { class: 'group-head' }, h('span', { class: 'group-label' }, 'タスク（' + tasks.length + '件）')),
       tasks.length ? h('ul', { class: 'card' }, tasks.map((t) => item(t.title, '削除 ' + U.fmtDateTime(t.deletedAt),
-        () => { T.restoreTask(t, nowIso()); save(['tasks']); renderAll(); render(); toast('タスクを戻しました'); },
-        () => purge(t.title, () => { S.data.tasks = S.data.tasks.filter((x) => x.id !== t.id); save(['tasks']); renderAll(); })))) : h('p', { class: 'empty small' }, 'ありません'),
+        () => {
+          const cur = findTask(t.id);
+          if (!cur || !T.restoreTask(cur, nowIso())) { render(); return; }
+          save(['tasks']); renderAll(); render(); toast('タスクを戻しました');
+        },
+        () => purge(t.title, () => {
+          const cur = findTask(t.id);
+          if (cur && cur.deletedAt && !cur.purgedAt) { T.purgeTask(cur, nowIso()); save(['tasks']); }
+          renderAll();
+        })))) : h('p', { class: 'empty small' }, 'ありません'),
       h('div', { class: 'group-head' }, h('span', { class: 'group-label' }, 'メモ（' + memos.length + '件）')),
       memos.length ? h('ul', { class: 'card' }, memos.map((m) => item(m.text, '削除 ' + U.fmtDateTime(m.deletedAt),
-        () => { m.deletedAt = null; save(['memos']); renderMemo(); render(); toast('メモを戻しました'); },
-        () => purge(m.text, () => { S.data.memos = S.data.memos.filter((x) => x.id !== m.id); save(['memos']); renderMemo(); })))) : h('p', { class: 'empty small' }, 'ありません'));
+        () => {
+          const cur = S.data.memos.find((x) => x.id === m.id);
+          if (!cur || cur.purgedAt) { render(); return; }
+          cur.deletedAt = null;
+          save(['memos']); renderMemo(); render(); toast('メモを戻しました');
+        },
+        () => purge(m.text, () => {
+          const cur = S.data.memos.find((x) => x.id === m.id);
+          if (cur && cur.deletedAt && !cur.purgedAt) { T.purgeMemo(cur, nowIso()); save(['memos']); }
+          renderMemo();
+        })))) : h('p', { class: 'empty small' }, 'ありません'));
   };
   render();
   openSheet({ title: 'ゴミ箱', content: box, cancelLabel: null, onDone: () => true, doneLabel: '閉じる' });
@@ -1986,6 +2123,9 @@ async function replaceAllData(newData, message) {
     return false;
   }
   S.data = newData;
+  const before = S.data.dragon.total;
+  D.settle(S.data.dragon, S.data.tasks, null, nowIso());
+  S.data.settings.xpModel = D.XP_MODEL;
   const ok = await save(ST.KEYS);
   if (!ok) {
     await reloadFromDb();
@@ -1993,7 +2133,8 @@ async function replaceAllData(newData, message) {
     return false;
   }
   await dayCheck(true);
-  toast(message);
+  const after = S.data.dragon.total;
+  toast(message + (before !== after ? '（竜の経験値は記録から数え直して ' + before.toLocaleString() + ' → ' + after.toLocaleString() + '）' : ''), before !== after ? { duration: 8000 } : undefined);
   return true;
 }
 
@@ -2029,6 +2170,18 @@ function openSettings() {
 
   const backupsBox = h('div');
   const storageBox = h('ul', { class: 'card kv' });
+  const versionBox = h('ul', { class: 'card kv' });
+
+  async function renderVersion() {
+    const hasSw = Boolean(navigator.serviceWorker && navigator.serviceWorker.controller);
+    const waiting = Boolean(S.sw && S.sw.waiting);
+    const v = await swVersion();
+    fill(versionBox,
+      h('li', {}, h('span', {}, 'いまの版'), h('span', { class: 'kv-v' }, v || APP_VERSION)),
+      h('li', {}, h('span', {}, '電波なしで開く'), h('span', { class: 'kv-v' }, hasSw ? 'できます（この端末に保存済み）' : 'まだできません（次に開いたときから）')),
+      waiting ? h('li', { class: 'form-row' }, h('span', { class: 'f-label' }, '新しい版があります'),
+        h('button', { type: 'button', class: 'mini-btn', onclick: () => { if (applyUpdate(true)) toast('新しい版に入れ替えます…'); } }, '更新')) : null);
+  }
 
   async function renderBackups() {
     let all = [];
@@ -2081,16 +2234,18 @@ function openSettings() {
       h('div', { class: 'group-head' }, h('span', { class: 'group-label' }, '記録')),
       h('ul', { class: 'card form' },
         h('li', {}, h('button', { type: 'button', class: 'action', onclick: openDoneLog }, icon('history'), '完了ログ')),
-        h('li', {}, h('button', { type: 'button', class: 'action', onclick: openTrash }, icon('trash'), 'ゴミ箱（' + (S.data.tasks.filter((t) => t.deletedAt).length + S.data.memos.filter((m) => m.deletedAt).length) + '件）')),
+        h('li', {}, h('button', { type: 'button', class: 'action', onclick: openTrash }, icon('trash'), 'ゴミ箱（' + (S.data.tasks.filter((t) => t.deletedAt && !t.purgedAt).length + S.data.memos.filter((m) => m.deletedAt && !m.purgedAt).length) + '件）')),
         h('li', {}, h('button', { type: 'button', class: 'action', onclick: openPastSchedule }, icon('calendar'), '過去の予定')),
         h('li', {}, h('button', { type: 'button', class: 'action', onclick: () => openGoalReview(S.ui.goalSeg) }, icon('target'), '目標のふり返り'))),
 
       h('div', { class: 'group-head' }, h('span', { class: 'group-label' }, 'このアプリについて')),
-      h('p', { class: 'sub-note' }, '実行リスト v1.2。データはこの端末のブラウザの中（IndexedDB）にだけ保存されます。外部への送信はしません。PCとスマホは別々の帳簿です（引っ越しは 書き出す → 読み込む）。'),
+      versionBox,
+      h('p', { class: 'sub-note' }, '実行リスト ' + APP_VERSION + '。データはこの端末のブラウザの中（IndexedDB）にだけ保存されます。外部への送信はしません。PCとスマホは別々の帳簿です（引っ越しは 書き出す → 読み込む）。'),
       h('ul', { class: 'card form' }, h('li', {}, h('a', { class: 'action', href: '/connect-test.html', onclick: openConnectTest }, icon('world'), '接続テスト（同期の準備）'))),
       h('p', { class: 'sub-note' }, 'PCとスマホの同期の準備として、Googleとつながるかを試すページです。そのページだけがGoogleと通信します。タスクやメモは送りません。'));
     renderBackups();
     renderStorage();
+    renderVersion();
   }
   render();
 }

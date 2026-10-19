@@ -2078,7 +2078,7 @@ function openSettings() {
         h('li', {}, h('button', { type: 'button', class: 'action', onclick: () => openGoalReview(S.ui.goalSeg) }, icon('target'), '目標のふり返り'))),
 
       h('div', { class: 'group-head' }, h('span', { class: 'group-label' }, 'このアプリについて')),
-      h('p', { class: 'sub-note' }, '実行リスト v1.0。データはこの端末のブラウザの中（IndexedDB）にだけ保存されます。外部への送信はしません。PCとスマホは別々の帳簿です（引っ越しは 書き出す → 読み込む）。'));
+      h('p', { class: 'sub-note' }, '実行リスト v1.1。データはこの端末のブラウザの中（IndexedDB）にだけ保存されます。外部への送信はしません。PCとスマホは別々の帳簿です（引っ越しは 書き出す → 読み込む）。'));
     renderBackups();
     renderStorage();
   }

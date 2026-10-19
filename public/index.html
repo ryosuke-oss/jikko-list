@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#F2F2F7">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; manifest-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="description" content="自分専用のタスク管理。データはこの端末の中だけに保存され、どこにも送られません。">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="実行リスト">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<title>実行リスト</title>
+<link rel="stylesheet" href="/css/style.css">
+<link rel="icon" href="/app-icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+</head>
+<body>
+<div id="boot" class="boot" role="status">読み込み中…</div>
+<div id="app" class="app" hidden></div>
+<div id="layer"></div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<noscript><p class="noscript">このアプリを使うには JavaScript を有効にしてください。</p></noscript>
+<script src="/vendor/Sortable.min.js" defer></script>
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>

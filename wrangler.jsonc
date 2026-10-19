@@ -1,0 +1,11 @@
+{
+  // Cloudflare Workers settings.
+  // This project only serves the static files in ./public (no server code),
+  // so the data people type into the app is never sent to the server.
+  "name": "jikko-list",
+  "compatibility_date": "2026-09-01",
+  "assets": {
+    "directory": "./public",
+    "not_found_handling": "none"
+  }
+}

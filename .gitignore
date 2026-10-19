@@ -1,0 +1,23 @@
+# dependencies / build
+node_modules/
+dist/
+.wrangler/
+
+# secrets - never commit
+.env
+.env.*
+.dev.vars
+*.pem
+*.key
+*.p12
+wrangler.toml.local
+
+# exported backups of the app data (personal data - never commit)
+jikko-list_*.json
+
+# os / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

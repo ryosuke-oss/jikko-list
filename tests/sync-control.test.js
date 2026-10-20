@@ -36,7 +36,7 @@ async function page(emu, opts = {}) {
     data = ST.newState('2026-10-20', new Date().toISOString());
     rev = await ST.saveKeys(db, data, ST.KEYS, rev);
   }
-  const p = { db, factory, session, local, trips: [], toasts: [], editing: false, typed: false, offline: false, flushed: 0, confirms: [], changes: 0 };
+  const p = { db, factory, session, local, trips: [], toasts: [], toastOpts: [], editing: false, typed: false, offline: false, flushed: 0, confirms: [], changes: 0 };
   p.app = {
     db,
     clock: { now: () => new Date().toISOString(), today: () => '2026-10-20' },
@@ -47,7 +47,7 @@ async function page(emu, opts = {}) {
     runExclusive: (fn) => fn(),
     adopt: () => {},
     onChange: () => { p.changes += 1; },
-    toast: (m) => p.toasts.push(m),
+    toast: (m, o) => { p.toasts.push(m); p.toastOpts.push(o || {}); },
     confirm: async (o) => { p.confirms.push(o.title); return true; },
     isPc: () => true,
     online: () => !p.offline,
@@ -92,6 +92,15 @@ async function connectedPage(emu) {
   await q.control.connect();
   assert.equal(q.control.view().connected, true);
   return q;
+}
+
+/** The person stays on Google's screen for `ms` before choosing (the departure is made that much older). */
+function linger(p, ms) {
+  for (const s of [p.session, p.local]) {
+    const v = JSON.parse(s.getItem('jikko-list.sync.pending'));
+    v.at -= ms;
+    s.setItem('jikko-list.sync.pending', JSON.stringify(v));
+  }
 }
 
 /** The key on the device runs out (as if an hour went by). */
@@ -149,6 +158,108 @@ test('connecting before logging in: the login comes first, and connecting carrie
   assert.equal(q.control.view().connected, true);
   assert.deepEqual(q.confirms, ['同期ファイルを作りますか？']); // nothing existed: asked before making it
   assert.equal(emu.sheets.files.length, 1);
+});
+
+test('back from Google\'s screen after more than 15 minutes: the key is not used, the screen says so, and its button goes again', async () => {
+  const emu = new FakeGoogleHttp();
+  const p = await page(emu);
+  await p.control.setClientId(CID);
+  await p.control.start(null);
+  assert.equal(await p.control.connect(), null); // "この端末をつなぐ" before logging in: to Google first
+  linger(p, 15 * 60 * 1000 + 6000); // the account chosen 15 minutes 6 seconds later (2026-10-20)
+  const { q, leaving } = await comeBack(emu, p);
+  assert.equal(leaving, false);
+  assert.equal(q.control.view().tokenOk, false); // the late key is thrown away
+  assert.equal((await ST.loadSync(q.db)).config.token || null, null);
+  assert.equal(q.session.getItem('jikko-list.sync.pending'), null);
+  assert.equal(q.local.getItem('jikko-list.sync.pending'), null);
+  assert.equal(q.toasts.length, 1);
+  assert.match(q.toasts[0], /ログインに時間がかかったため（15分以上）、やり直しが必要です/);
+  assert.equal(q.toastOpts[0].actionLabel, 'ログイン');
+  assert.ok(q.toastOpts[0].duration >= 10000);
+  await wait(600); // nothing carries on with the late key
+  assert.equal(q.control.view().connected, false);
+  assert.deepEqual(q.confirms, []);
+  assert.equal(emu.sheets.files.length, 0);
+  // the toast's button: the account chooser again; back in time, connecting carries on by itself
+  q.toastOpts[0].onAction();
+  await until(() => q.trips.length === 1);
+  assert.equal(new URL(q.trips[0]).searchParams.get('prompt'), 'select_account');
+  const { q: ok } = await comeBack(emu, q);
+  await until(() => ok.control.view().connected, 3000);
+  assert.equal(ok.control.view().connected, true);
+  assert.deepEqual(ok.confirms, ['同期ファイルを作りますか？']);
+  assert.equal(ok.toasts.some((m) => /時間がかかった/.test(m)), false);
+});
+
+test('the 15-minute check stays: 14 minutes 50 seconds is accepted; a late answer with an error is told the same way', async () => {
+  const emu = new FakeGoogleHttp();
+  const p = await page(emu);
+  await p.control.setClientId(CID);
+  await p.control.start(null);
+  await p.control.login({ silent: false });
+  linger(p, 14 * 60 * 1000 + 50 * 1000);
+  const { q } = await comeBack(emu, p);
+  assert.equal(q.control.view().tokenOk, true);
+  assert.deepEqual(q.toasts, []);
+  // the person pressed "キャンセル" on Google's screen 20 minutes after leaving
+  await q.control.login({ silent: false });
+  const state = new URL(q.trips[0]).searchParams.get('state');
+  linger(q, 20 * 60 * 1000);
+  const r = await reopen(emu, q);
+  assert.equal(await r.control.start({ token: null, expiresIn: null, scope: '', state, error: 'access_denied' }), false);
+  assert.match(r.toasts.join('\n'), /時間がかかったため/);
+  assert.equal(r.toastOpts[0].actionLabel, 'ログイン');
+});
+
+test('an answer that is not from a login started on this screen (another link): not used, told in other words, no button', async () => {
+  const emu = new FakeGoogleHttp();
+  const p = await page(emu);
+  await p.control.setClientId(CID);
+  await p.control.start(null);
+  await p.control.login({ silent: false });
+  const { q } = await comeBack(emu, p, { tamper: true });
+  assert.equal(q.control.view().tokenOk, false);
+  assert.equal(q.toasts.length, 1);
+  assert.match(q.toasts[0], /この画面から始めたログインか確かめられないため/);
+  assert.equal(q.toastOpts[0].actionLabel, undefined);
+  // a page that never left: opened from a link with a key in its address
+  const other = await page(emu);
+  await other.control.setClientId(CID);
+  assert.equal(await other.control.start({ token: emu.issueToken(), expiresIn: 3599, scope: '', state: 'abc', error: null }), false);
+  assert.equal(other.control.view().tokenOk, false);
+  assert.equal((await ST.loadSync(other.db)).config.token || null, null);
+  assert.match(other.toasts.join('\n'), /確かめられないため/);
+  assert.doesNotMatch(other.toasts.join('\n'), /時間がかかった/);
+});
+
+test('a trip without a screen that came back late (e.g. the phone slept on the way): nothing is said, the app goes again by itself', async () => {
+  const emu = new FakeGoogleHttp();
+  const q = await connectedPage(emu);
+  await expireKey(q);
+  const r = await reopen(emu, q);
+  assert.equal(await r.control.start(null), true); // the trip without a screen
+  linger(r, 16 * 60 * 1000);
+  const back = await comeBack(emu, r);
+  assert.equal(back.leaving, true); // again without a screen (the page leaves, so nothing is shown)
+  assert.deepEqual(back.q.toasts, []);
+  assert.equal(new URL(back.q.trips[0]).searchParams.get('prompt'), 'none');
+  const again = await comeBack(emu, back.q);
+  assert.equal(again.leaving, false);
+  assert.equal(again.q.control.view().tokenOk, true);
+  assert.deepEqual(again.q.toasts, []);
+});
+
+test('the login button on a connected device, back after 30 minutes: the key it had stays in use, the late one is not used, the screen says so', async () => {
+  const emu = new FakeGoogleHttp();
+  const q = await connectedPage(emu);
+  const before = (await ST.loadSync(q.db)).config.token.value;
+  assert.equal(await q.control.login({ silent: false }), true);
+  linger(q, 30 * 60 * 1000);
+  const back = await comeBack(emu, q);
+  assert.equal(back.leaving, false);
+  assert.equal((await ST.loadSync(back.q.db)).config.token.value, before);
+  assert.match(back.q.toasts.join('\n'), /時間がかかったため/);
 });
 
 test('a new key without a screen: on opening when it ran out (once, never two trips at once), never while editing', async () => {

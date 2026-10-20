@@ -114,14 +114,23 @@ export function createSyncControl(app) {
     return ok;
   }
 
+  /**
+   * The departure this answer belongs to (taken off the storages either way). { p }: ours, left less than 15 minutes
+   * ago. { late }: ours, but older than that (the person took longer at Google). {}: none of ours (another link,
+   * or a trip that was given up).
+   */
   function takePending(state) {
     let found = null;
+    let late = null;
     for (const s of storages()) {
       const p = readJson(s, PENDING_KEY);
-      if (p && state && p.state === state && now() - (p.at || 0) < PENDING_MAX_AGE) found = found || p;
+      if (p && state && p.state === state) {
+        if (now() - (p.at || 0) < PENDING_MAX_AGE) found = found || p;
+        else late = late || p;
+      }
       try { s.removeItem(PENDING_KEY); } catch (e) { /* ignore */ }
     }
-    return found;
+    return found ? { p: found } : { late };
   }
 
   /**
@@ -177,8 +186,11 @@ export function createSyncControl(app) {
 
   /** The page came back from Google (read once at start-up; the address was cleaned already). */
   async function acceptReturn(r) {
-    const p = takePending(r.state);
-    if (!p) return { ok: false, why: 'state' }; // not our own departure: the key is thrown away
+    const { p, late } = takePending(r.state);
+    // not our own departure, or one from too long ago: the key is thrown away (the person is told once the screen
+    // is there, see tellUnused)
+    if (late) return { ok: false, why: 'late', silent: Boolean(late.silent), then: late.then || null };
+    if (!p) return { ok: false, why: 'state' };
     if (r.error || !r.token) {
       await saveCfg({ autoFailAt: p.silent ? now() : cfg.autoFailAt || null });
       st.loginNeeded = true;
@@ -188,6 +200,24 @@ export function createSyncControl(app) {
     await saveCfg({ token, autoFailAt: null });
     st.loginNeeded = false;
     return { ok: true, silent: p.silent, then: p.then || null };
+  }
+
+  /**
+   * An answer from Google that was not used is told once the screen is there (before, nothing was said and the
+   * settings only showed "未ログイン"). A trip without a screen that came back late says nothing: the app goes
+   * again by itself, or the banner shows the button.
+   */
+  function tellUnused(r) {
+    if (!r || r.ok) return;
+    if (r.why === 'late' && !r.silent) {
+      app.toast('ログインに時間がかかったため（' + Math.round(PENDING_MAX_AGE / 60000) + '分以上）、やり直しが必要です。もう一度［ログイン］を押してください', {
+        duration: 12000,
+        actionLabel: 'ログイン',
+        onAction: () => { login({ silent: false, then: r.then }).catch((e) => console.error(e)); }, // "つなぐ" carries on after it
+      });
+    } else if (r.why === 'state') {
+      app.toast('この画面から始めたログインか確かめられないため、Google からの結果は使いませんでした。ログインするときは 設定 → 同期 から始めてください', { duration: 10000 });
+    }
   }
 
   /**
@@ -492,6 +522,13 @@ export function createSyncControl(app) {
     await reloadCfg();
     if (returned) st.lastLogin = await acceptReturn(returned);
     else await forgetUnansweredTrip();
+    const leaving = await begin();
+    if (!leaving) tellUnused(st.lastLogin); // a page that leaves again comes back with an answer of its own
+    return leaving;
+  }
+
+  /** After the login answer: the first sync, or a new key without a screen (true: the page is leaving). */
+  async function begin() {
     await refreshStatus();
     if (!cfg.clientId || !cfg.fileId) {
       // a new key: whose it is, for the screen and the next login hint (behind the screen, never waited for)

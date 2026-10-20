@@ -1,7 +1,7 @@
 # 実行リスト (jikko-list)
 
-ブラウザの中だけで動く、自分専用のタスク管理アプリです。
-A personal task list that runs entirely in the browser. All data stays on the device (IndexedDB).
+ブラウザの中で動く、自分専用のタスク管理アプリです。データは端末の中（IndexedDB）に保存し、同期をオンにすると、自分の Google ドライブのスプレッドシート1つを通して PC とスマホの中身をそろえます。
+A personal task list that runs in the browser. Data stays on the device (IndexedDB); an optional sync keeps devices in step through one spreadsheet in the user's own Google Drive.
 
 ## できること
 
@@ -16,17 +16,20 @@ A personal task list that runs entirely in the browser. All data stays on the de
 - 書き出し（JSON）・読み込み・1日1回の自動の控え（7日分）・ゴミ箱
 - 電波がなくても開ける：アプリの部品（HTML・CSS・JS・アイコン）を Service Worker でこの端末にしまっておく（[`public/sw.js`](public/sw.js)）。新しい版は、編集中でないときに自動で入れ替わる（設定に「いまの版」と［更新］）
 - PC は3列、タブレットは2列、スマホは1列＋下のタブバー。どの幅でも横スクロールなし
+- 同期（設定 → 同期。オンにしたときだけ）：PC とスマホの中身を、Google ドライブのスプレッドシート1つ（同期ファイル）を通してそろえる。電波がない間の変更は、つながったときに送る。2台で違う所を直したら両方入れ、同じ所を直したときと、合わせると何かが消えるときだけ「どちらを残す？」と聞く。同期ファイルには、端末ごとのタブに変更を1行ずつ下に足すだけ（前の行は書き換えない）
 
 ## データとセキュリティ
 
-- **データはこの端末のブラウザの中（IndexedDB）にだけ保存します。** サーバーへの送信、解析、広告、Cookie はありません
+- **データはこの端末のブラウザの中（IndexedDB）に保存します。** このサイトのサーバーにデータは来ません。解析、広告、Cookie はありません
+- **同期をオンにしたときだけ**、ログインした Google アカウントのドライブにある同期ファイル（このアプリが作ったスプレッドシート1つ）とやりとりします。通信先は `www.googleapis.com`（Drive）と `sheets.googleapis.com`（Sheets）の2つだけで、通信するのは [`public/js/sync/google.js`](public/js/sync/google.js) だけです。オフ・一時停止のときは Google と通信しません
+- Google へのログインは、Google のログイン画面へページごと移動して戻ってくる方式です（Google のプログラムは読み込みません）。権限は `drive.file`（このアプリが作ったファイルだけ）。戻ってきたアドレスに付いた鍵（1時間で切れる）はすぐにアドレスから消し、この端末の中にだけ置きます。クライアントID はコードに書かず、使う人が設定で貼ります
 - 外部のファイル（CDN・Webフォント）を読み込みません。部品もアイコンも同じ場所から配信します
-- `Content-Security-Policy`（`default-src 'none'`・`connect-src 'self'`・`worker-src 'self'`）などのヘッダーで、外部との通信やページの埋め込みを止めています（[`public/_headers`](public/_headers)）。`'self'` は、自分のサイトの部品を端末にしまう Service Worker のためだけです
+- `Content-Security-Policy`（`default-src 'none'`・`connect-src 'self' https://sheets.googleapis.com https://www.googleapis.com`・`worker-src 'self'`）などのヘッダーで、それ以外との通信やページの埋め込みを止めています（[`public/_headers`](public/_headers)）。`'self'` は、自分のサイトの部品を端末にしまう Service Worker のためです
 - 画面は `textContent` / `createElement` だけで組み立てます。`innerHTML` と `eval` は使いません
 - リンクは `http://` と `https://` だけを保存し、`noopener noreferrer` で開きます
 - 読み込むファイルは形式と版を確かめ、合わなければ1件も書き換えません。読み込みの直前の状態は自動で控えます
-- サーバー側の処理や外から呼べる窓口（API）がない静的なサイトなので、呼び出し回数の制限（レート制限）は入れていません
-- 例外は接続テスト用のページ [`/connect-test.html`](public/connect-test.html) だけです（同期の準備・試験用）。このページに限り、Google の `www.googleapis.com` と `sheets.googleapis.com` への通信を許可しています（`public/_headers` でこのページだけ CSP を差し替え）。ログインは Google の画面へ移動する方式（部品の読み込みなし）、権限は `drive.file`（このアプリが作ったファイルだけ）。送るのはテスト用の行だけで、アプリのタスクやメモは送りません。クライアントIDはコードに書かず、使う人が画面で貼ります
+- サーバー側の処理や外から呼べる窓口（API）がない静的なサイトなので、サイト側の呼び出し回数の制限（レート制限）は入れていません。同期は、アプリの中で「最短10秒おき・1時間120回まで」に止めています（Google を呼び続けないため）
+- 接続テスト用のページ [`/connect-test.html`](public/connect-test.html)（同期の準備・試験用）は、そのページ専用の CSP（Google の2つだけ）で動きます。送るのはテスト用の行だけで、アプリのタスクやメモは送りません
 
 ## 手元で動かす
 
@@ -42,7 +45,7 @@ python3 -m http.server 8787 --directory public
 npm test
 ```
 
-Node.js 20 以上。1行の解釈・状態の連動・経験値の計算・期間の切り替え・読み込みの点検を確かめます。
+Node.js 20 以上。1行の解釈・状態の連動・経験値の計算・期間の切り替え・読み込みの点検と、同期（版の名前・合流のルール・同期の流れ。Google の代わりにメモリの中の偽物を使い、2〜3台の同時操作・電波切れ・二重送信・手で触った行などを再現）を確かめます。
 
 ## 公開
 

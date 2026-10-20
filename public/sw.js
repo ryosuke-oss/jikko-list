@@ -4,7 +4,7 @@
 // VERSION and FILES are written by `npm run stamp`; tests/sw.test.js checks they are up to date,
 // so a changed file always comes with a new version (the new version replaces the old box).
 
-const VERSION = 'v1.3-cac2c301';
+const VERSION = 'v1.4-2112a267';
 const CACHE = 'jikko-list-' + VERSION;
 const FILES = [
   '/app-icon.svg',
@@ -68,7 +68,15 @@ const FILES = [
   '/js/dragon.js',
   '/js/parse.js',
   '/js/plan.js',
+  '/js/savequeue.js',
   '/js/store.js',
+  '/js/sync/control.js',
+  '/js/sync/engine.js',
+  '/js/sync/google.js',
+  '/js/sync/merge.js',
+  '/js/sync/records.js',
+  '/js/sync/rev.js',
+  '/js/sync/ui.js',
   '/js/tasks.js',
   '/js/ui.js',
   '/js/util.js',

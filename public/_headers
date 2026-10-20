@@ -1,5 +1,5 @@
 /*
-  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; worker-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://sheets.googleapis.com https://www.googleapis.com; worker-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
   X-Content-Type-Options: nosniff
   X-Frame-Options: DENY
   Referrer-Policy: no-referrer
@@ -13,9 +13,9 @@
 /sw.js
   Cache-Control: no-cache
 
-# Connection test page only (sync preparation): the global policy above is removed and
-# replaced by one that also allows the two Google API hosts. The app itself only talks to its own site
-# ('self': the service worker keeping the app's files on the device).
+# The app talks to its own site ('self': the service worker keeping the app's files on the device) and, only when
+# the sync is turned on, to the two Google API hosts (the sync file in the Google Drive of the account logged in).
+# Connection test page only (sync preparation): the global policy above is removed and replaced by its own one.
 # These rules must stay below "/*": matching rules are applied in file order.
 # /connect-test.html is answered with a redirect to /connect-test, so both paths are listed.
 /connect-test

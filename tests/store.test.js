@@ -132,5 +132,5 @@ test('a mark read without a trash date is put in the trash; the database version
   const m = cleanMemo({ id: 'm', text: '', createdAt: AT, taskId: null, deletedAt: null, purgedAt: AT });
   assert.equal(m.deletedAt, AT);
   assert.equal(m.text, '（消したメモ）');
-  assert.equal(DB_VERSION, 2);
+  assert.equal(DB_VERSION, 3); // 2 in 3-1 (stops tabs of 1.2), 3 in 3-2 (the sync stores)
 });

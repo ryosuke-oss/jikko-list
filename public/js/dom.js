@@ -66,6 +66,7 @@ export function debounce(fn, ms) {
   wrapped.flush = (...args) => {
     if (timer) { clearTimeout(timer); timer = null; fn(...args); }
   };
+  wrapped.pending = () => timer !== null;
   return wrapped;
 }
 

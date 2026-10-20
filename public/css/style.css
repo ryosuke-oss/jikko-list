@@ -595,3 +595,33 @@ html[data-layout="mobile"] .toast.show { transform: none; }
 .i-users-group { -webkit-mask-image: url(/icons/users-group.svg); mask-image: url(/icons/users-group.svg); }
 .i-world { -webkit-mask-image: url(/icons/world.svg); mask-image: url(/icons/world.svg); }
 .i-x { -webkit-mask-image: url(/icons/x.svg); mask-image: url(/icons/x.svg); }
+
+/* ---- sync (3-3): the status next to the tools, banners, "どちらを残す？" ---- */
+.sync-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 46vw; padding: 5px 10px; margin-right: 4px; border-radius: 999px; background: var(--bg); color: var(--text2); font-size: var(--fs-foot); white-space: nowrap; align-self: center; }
+.sync-chip-text { overflow: hidden; text-overflow: ellipsis; }
+.sync-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: #C7C7CC; }
+.sync-chip.t-green .sync-dot { background: var(--green); }
+.sync-chip.t-orange { background: #FFF1E3; color: #B55A00; }
+.sync-chip.t-orange .sync-dot { background: var(--orange); }
+.sync-chip.t-red { background: #FFECEC; color: var(--red); }
+.sync-chip.t-red .sync-dot { background: var(--red); }
+.banner.choose { background: #FFF1E3; }
+.banner.choose .banner-icon { color: var(--orange); }
+.banner.danger { background: #FFECEC; }
+.banner.danger .banner-icon { color: var(--red); }
+.danger-text { color: var(--red); }
+.q-card + .q-card { margin-top: 18px; }
+.q-row { display: flex; flex-direction: column; gap: 6px; padding: 10px 16px; }
+.q-field { font-weight: 600; font-size: var(--fs-sub); }
+.q-sides { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.q-side { display: flex; flex-direction: column; gap: 2px; min-width: 0; background: var(--bg); border-radius: 8px; padding: 8px 10px; }
+.q-who { color: var(--text2); font-size: var(--fs-foot); }
+.q-val { overflow-wrap: anywhere; }
+.q-btns { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.q-btns .btn { flex: 1 1 160px; }
+.form-row .field.small { flex: 1 1 120px; width: auto; padding: 7px 10px; }
+@media (max-width: 767.98px) {
+  .q-sides { grid-template-columns: 1fr; }
+  .sync-chip { max-width: 40vw; }
+}
+.settings ul.card + ul.card { margin-top: 12px; }

@@ -1,6 +1,7 @@
 // 実行リスト — start-up, screens and user actions.
-// Data lives only in this browser (IndexedDB). The only network code is the service worker
-// (sw.js), which keeps this site's own files on the device so the app opens without a connection.
+// Data lives in this browser (IndexedDB). The service worker (sw.js) keeps this site's own files on the device so the
+// app opens without a connection. When the person turns the sync on (設定 → 同期), the sync (sync/) also talks to
+// Google: only to the sync file in the Google Drive of the account logged in (sync/google.js is the only door).
 
 import { h, icon, fill, shapesSvg, debounce, isPlainEnter } from './dom.js';
 import { openSheet, alertDialog, confirmDialog, pickFrom, toast, isPhone, overlayOpen } from './ui.js';
@@ -10,11 +11,21 @@ import * as T from './tasks.js';
 import * as D from './dragon.js';
 import * as PL from './plan.js';
 import * as ST from './store.js';
+import { queueSave, queueCommit, queueRun } from './savequeue.js';
+import { createSyncControl } from './sync/control.js';
+import * as SU from './sync/ui.js';
+import { parseAuthReturn } from './sync/google.js';
+import { mergeImport } from './sync/records.js';
+
+// A login result comes back in the address (#access_token=…): it is read once, and the address is cleaned at once
+// (the key never stays in the address bar or the page history).
+const AUTH_RETURN = parseAuthReturn(location.hash, location.search);
+if (AUTH_RETURN) history.replaceState(null, '', location.pathname);
 
 const TAB_ID = U.uid();
 const UI_KEY = 'jikko-list.ui';
 // Shown in the settings. Changing it (or any file under public/) needs `npm run stamp` (tests check it).
-const APP_VERSION = 'v1.3';
+const APP_VERSION = 'v1.4';
 
 const S = {
   db: null,
@@ -25,6 +36,10 @@ const S = {
   filters: T.emptyFilters(),
   recentlyDone: new Map(),
   queue: Promise.resolve(),
+  waiting: 0, // saves queued and not written yet (the sync lets them go first)
+  dragging: false, // a row of the list or the schedule is being dragged (since dragAt)
+  dragAt: 0,
+  drawLater: false, // something asked for a full redraw during the drag
   bc: null,
   layout: '',
   sortables: {},
@@ -34,6 +49,11 @@ const S = {
   swTimer: null,
   reloadTimer: null,
   reloading: false,
+  sync: null, // sync/control.js (does nothing until the sync is turned on)
+  heldStart: null, // the start-up waits while the page goes to Google ({ recount })
+  editing: new Set(), // item keys open for editing (task:<id> while its detail is open, ...)
+  hiddenAt: null,
+  lastInput: Date.now(),
 };
 
 const C = {}; // components that are created once and re-filled
@@ -114,29 +134,22 @@ function kindIcon(kind) {
 
 /** Queue a save of the given keys (one transaction each, in order). Resolves to true when it was written. */
 function save(keys) {
-  const data = S.data;
-  S.queue = S.queue.then(async () => {
-    if (data !== S.data) {
-      toast('別のタブの変更を読み込んだため、直前の操作は保存されませんでした');
-      return false;
-    }
-    try {
-      const rev = await ST.saveKeys(S.db, data, keys, S.rev);
-      S.rev = rev;
+  return queueSave(S, keys, {
+    write: (data, k, rev) => ST.saveKeys(S.db, data, k, rev),
+    saved: (rev) => {
       if (S.bc) S.bc.postMessage({ type: 'saved', rev, from: TAB_ID });
-      return true;
-    } catch (e) {
-      if (e instanceof ST.ConflictError) {
-        await reloadFromDb();
-        toast('別のタブで変更があったので読み直しました。もう一度操作してください');
-      } else {
-        console.error(e);
-        toast('保存できませんでした。設定 → 書き出す で控えを取ってください', { duration: 8000 });
-      }
-      return false;
-    }
+      if (S.sync) S.sync.soon();
+    },
+    stale: () => toast('画面の中身が入れ替わったため（別のタブの変更・同期）、直前の操作は保存されませんでした。もう一度操作してください', { duration: 6000 }),
+    conflict: async () => {
+      await reloadFromDb();
+      toast('別のタブで変更があったので読み直しました。もう一度操作してください');
+    },
+    failed: (e) => {
+      console.error(e);
+      toast('保存できませんでした。設定 → 書き出す で控えを取ってください', { duration: 8000 });
+    },
   });
-  return S.queue;
 }
 
 function fillMissing(raw) {
@@ -163,9 +176,102 @@ async function reloadFromDb() {
 async function checkRev() {
   if (!S.db) return;
   const { rev } = await ST.loadState(S.db).catch(() => ({ rev: S.rev }));
-  if (rev !== S.rev) {
-    S.queue = S.queue.then(reloadFromDb);
+  if (rev !== S.rev) queueRun(S, reloadFromDb);
+}
+
+// ---------------------------------------------------------------- the sync's view of the app
+
+/** Item keys being edited now: the open detail and the like, plus a goal / schedule / memo line being typed. */
+function editingKeys() {
+  const keys = new Set(S.editing);
+  const a = document.activeElement;
+  if (!a || !S.data) return keys;
+  // a goal line being typed (a focused button of the goals card, e.g. 週/月/年, is not typing)
+  if (C.goals && C.goals.contains(a) && a.classList && a.classList.contains('goal-input')) keys.add('goal:' + S.ui.goalSeg + ':' + PL.storedKey(S.data.goals, S.ui.goalSeg));
+  if (a.classList && a.classList.contains('line-edit')) {
+    if (C.schedUl && C.schedUl.contains(a)) keys.add('schedule:' + S.data.schedule.date);
+    const li = a.closest ? a.closest('li[data-id]') : null;
+    if (li && C.memoUl && C.memoUl.contains(li)) keys.add('memo:' + li.dataset.id);
   }
+  return keys;
+}
+
+async function flushSaves() {
+  saveGoals.flush();
+  await S.queue;
+}
+
+/** Text typed into the add fields (quick add, memo, schedule) and not added yet. */
+function hasTypedText() {
+  return [...document.querySelectorAll('.qa-input, .line-input')].some((el) => el.value.trim() !== '');
+}
+
+/**
+ * Editing in the sense of 7-2 (the page must not leave for Google now): a sheet is open, text is typed and not added
+ * yet, or a goal / schedule / memo line is being written. A cursor left in an empty add field is not editing.
+ */
+function isEditingForSync() {
+  return overlayOpen() || hasTypedText() || editingKeys().size > 0;
+}
+
+/** The sync's write, in the app's save queue (the person's own changes go first: savequeue.js). */
+function syncCommit(data, expectedRev, write) {
+  return queueCommit(S, data, expectedRev, write, {
+    typing: () => saveGoals.pending() || dragOn(),
+    flushTyping: () => saveGoals.flush(),
+    after: (rev) => {
+      if (S.bc) S.bc.postMessage({ type: 'saved', rev, from: TAB_ID });
+      renderAll();
+    },
+  });
+}
+
+/** What the sync needs from the app (sync/control.js). */
+function syncApp() {
+  return {
+    db: S.db,
+    clock: { now: nowIso, today: () => S.today },
+    isEditingKey: (key) => editingKeys().has(key),
+    isEditingAny: isEditingForSync,
+    hasTypedText,
+    flushSaves,
+    commit: syncCommit,
+    // other writes of the sync go into the same queue as the app's own saves, so neither overwrites the other
+    runExclusive: (fn) => {
+      saveGoals.flush();
+      return queueRun(S, fn);
+    },
+    adopt: (data, rev) => {
+      S.data = data;
+      S.rev = rev;
+      if (S.bc) S.bc.postMessage({ type: 'saved', rev, from: TAB_ID });
+      renderAll();
+    },
+    onChange: () => { if (S.data) { renderBanners(); renderHeader(); if (S.layout === 'mobile') renderHeads(); renderList(); } },
+    toast: (m, o) => toast(m, o),
+    confirm: (o) => confirmDialog(o),
+    isPc: () => S.layout !== 'mobile',
+    online: () => navigator.onLine !== false,
+    visible: () => document.visibilityState === 'visible',
+    location: { origin: location.origin, assign: (url) => location.assign(url) },
+  };
+}
+
+function syncCtx() {
+  const people = peopleMap();
+  return { personName: (id) => (people.get(id) ? people.get(id).name : ''), baseYear: thisYear(), after: () => renderAll() };
+}
+
+/** The item waits for "どちらを残す？" (shown as "要選択"). */
+function waitsAnswer(key) {
+  return Boolean(S.sync && S.sync.isQuestion(key));
+}
+
+/** An item that waits for "どちらを残す？" cannot be changed: the question opens instead. Returns true when it did. */
+function askFirst(key) {
+  if (!S.sync || !S.sync.isQuestion(key)) return false;
+  SU.openQuestions(S.sync, syncCtx(), key);
+  return true;
 }
 
 // ---------------------------------------------------------------- start-up
@@ -204,13 +310,45 @@ async function start() {
   setupLayout();
   await dayCheck(true);
   persistCheck();
+  // the sync: the login result, a new key without a screen when it ran out (the page may leave for a moment), the first sync.
+  // A problem there never stops the app: the data on this device can always be used.
+  try {
+    S.sync = createSyncControl(syncApp());
+    if (await S.sync.start(AUTH_RETURN)) {
+      fill(document.getElementById('boot'), 'Googleで確認しています…');
+      S.heldStart = { recount }; // shown if the browser brings this page back without leaving ("戻る" from Google)
+      return;
+    }
+  } catch (e) {
+    console.error(e);
+    setTimeout(() => toast('同期を始められませんでした（この端末の中のデータはそのまま使えます）', { duration: 8000 }), 1000);
+  }
+  showApp(recount);
+}
+
+/** The screen, once the start-up is over (also when the page comes back from Google's screen with "戻る"). */
+function showApp(recount) {
+  S.heldStart = null;
   setupTimers();
   document.getElementById('app').hidden = false;
-  document.getElementById('boot').remove();
+  const boot = document.getElementById('boot');
+  if (boot) boot.remove();
   if (performance.mark) performance.mark('jikko:ready'); // start-up time, readable in the browser tools
   // shown a little later, so that it does not hide the start-up notices (e.g. tasks back from the later box)
   if (recount) setTimeout(() => toast('竜の経験値を記録から数え直しました（前 ' + recount.before.toLocaleString() + ' → 今 ' + recount.after.toLocaleString() + '）', { duration: 8000 }), 3500);
 }
+
+/**
+ * "戻る" on Google's screen can bring this page back from the browser's memory (it never really left): the trip
+ * to Google is over (one without a screen counts as a failed try), and a start-up that was waiting goes on.
+ */
+window.addEventListener('pageshow', (e) => {
+  if (!e.persisted || !S.sync) return;
+  S.sync.restored().then(() => {
+    if (S.heldStart) showApp(S.heldStart.recount);
+    else renderAll();
+  }, (err) => console.error(err));
+});
 
 /**
  * The dragon's points are counted from the records (version 1.3). The first time this version opens
@@ -273,7 +411,7 @@ function applyUpdate(force) {
   const w = S.sw && S.sw.waiting;
   if (!w || (!force && isEditing())) return false;
   saveGoals.flush();
-  S.queue.then(() => w.postMessage({ type: 'skip-waiting' }));
+  queueRun(S, () => w.postMessage({ type: 'skip-waiting' }));
   return true;
 }
 
@@ -371,7 +509,7 @@ function setupChannel() {
     const m = e.data;
     if (!m || m.from === TAB_ID || m.type !== 'saved') return;
     if (m.rev === S.rev) return;
-    S.queue = S.queue.then(async () => {
+    queueRun(S, async () => {
       await reloadFromDb();
       toast('別のタブの変更を読み込みました');
     });
@@ -397,15 +535,28 @@ function setupTimers() {
   const toMidnight = () => {
     const n = new Date();
     const next = new Date(n.getFullYear(), n.getMonth(), n.getDate() + 1, 0, 0, 5);
-    setTimeout(() => { dayCheck(true); toMidnight(); }, next.getTime() - n.getTime());
+    setTimeout(async () => { await dayCheck(true); if (S.sync) S.sync.syncNow('day'); toMidnight(); }, next.getTime() - n.getTime());
   };
   toMidnight();
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState !== 'visible') return;
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState !== 'visible') {
+      S.hiddenAt = Date.now();
+      // a PC left open: a new key while nothing is shown, when little time is left (7-2)
+      if (S.sync) S.sync.maybeRefresh('hidden');
+      return;
+    }
+    const hiddenFor = S.hiddenAt ? Date.now() - S.hiddenAt : 0;
     checkRev();
-    dayCheck(false);
+    await dayCheck(false); // the date first, then the sync (7-7)
     checkForUpdate();
+    if (S.sync && !(await S.sync.maybeRefresh('visible', { hiddenFor }))) S.sync.syncNow('visible');
   });
+  window.addEventListener('online', () => { if (S.sync) S.sync.syncNow('online'); });
+  window.addEventListener('offline', () => renderBanners());
+  for (const ev of ['pointerdown', 'keydown', 'wheel', 'touchstart']) document.addEventListener(ev, () => { S.lastInput = Date.now(); }, { passive: true, capture: true });
+  setInterval(() => {
+    if (document.visibilityState === 'visible' && S.sync) S.sync.maybeRefresh('idle', { idleFor: Date.now() - S.lastInput });
+  }, 30 * 1000);
 }
 
 // ---------------------------------------------------------------- layout
@@ -510,7 +661,7 @@ function setTab(key) {
 // ---------------------------------------------------------------- render
 
 function renderAll() {
-  if (!S.data) return;
+  if (!S.data || holdForDrag()) return;
   renderBanners();
   renderHeader();
   renderTiles();
@@ -532,6 +683,7 @@ function renderAll() {
 
 function headTools() {
   return h('div', { class: 'head-tools' },
+    S.sync ? SU.statusChip(S.sync, syncCtx()) : null,
     toolButton('history', '完了ログ', openDoneLog),
     toolButton('settings', '設定', openSettings));
 }
@@ -577,13 +729,13 @@ function daysSince(iso) {
 }
 
 function renderBanners() {
-  const items = [];
+  const items = S.sync ? SU.syncBanners(S.sync, syncCtx()) : [];
   if (isIosBrowserTab() && !S.iosBannerHidden) {
     items.push(h('div', { class: 'banner' },
       icon('device-mobile', 'banner-icon'),
       h('div', { class: 'banner-text' },
         h('strong', {}, 'ホーム画面に追加して使ってください'),
-        h('span', {}, 'Safari のままだと、しばらく開かないとデータが消えることがあります。共有ボタン →「ホーム画面に追加」。Safari とホーム画面版のデータは別々です。')),
+        h('span', {}, 'Safari のままだと、しばらく開かないとデータが消えることがあります（同期をオンにしていれば取り戻せます）。共有ボタン →「ホーム画面に追加」。Safari とホーム画面版のデータは別々です。')),
       h('button', { type: 'button', class: 'banner-x', 'aria-label': 'この案内を閉じる', onclick: () => { S.iosBannerHidden = true; renderBanners(); } }, icon('x'))));
   }
   const st = S.data.settings;
@@ -642,6 +794,7 @@ function visibleTasks() {
 }
 
 function renderList() {
+  if (holdForDrag()) return;
   const smart = T.SMART_LISTS.find((s) => s.key === S.ui.smart);
   const n = T.activeFilterCount(S.filters);
   fill(C.listHead, 
@@ -725,6 +878,7 @@ function taskRow(t, opts) {
     meta = T.rowMeta(t, peopleMap(), S.today);
     if (t.returnedMark) meta.unshift({ text: '箱から戻りました', tone: 'returned' });
   }
+  if (S.sync && S.sync.isQuestion('task:' + t.id)) meta.unshift({ text: '要選択', tone: 'orange' });
   if (meta.length) lines.push(metaLine(meta));
   const main = h('div', {
     class: 'row-main',
@@ -744,6 +898,31 @@ function taskRow(t, opts) {
 }
 
 // ---- drag & drop
+
+/** A row is being dragged now (a drag that somehow never ended stops counting after a minute). */
+function dragOn() {
+  if (S.dragging && Date.now() - S.dragAt > 60 * 1000) S.dragging = false;
+  return S.dragging;
+}
+
+function startDrag() {
+  S.dragging = true;
+  S.dragAt = Date.now();
+}
+
+/** While a row is dragged nothing is drawn again (the drag would lose its row); what was asked for is drawn after. */
+function holdForDrag() {
+  if (!dragOn()) return false;
+  S.drawLater = true;
+  return true;
+}
+
+function drawAfterDrag() {
+  if (!S.drawLater) return false;
+  S.drawLater = false;
+  renderAll();
+  return true;
+}
 
 function setupSortables() {
   const Sortable = globalThis.Sortable;
@@ -769,14 +948,16 @@ function setupSortables() {
     S.sortables.list = Sortable.create(C.listUl, Object.assign({}, common, {
       group: { name: 'tasks', pull: true, put: false },
       draggable: '.row',
-      onStart: () => document.documentElement.classList.add('dragging'),
+      onStart: () => { startDrag(); document.documentElement.classList.add('dragging'); },
       onEnd: (evt) => {
         document.documentElement.classList.remove('dragging');
-        if (evt.to !== evt.from || evt.oldIndex === evt.newIndex) return;
+        S.dragging = false;
+        if (evt.to !== evt.from || evt.oldIndex === evt.newIndex) { drawAfterDrag(); return; }
+        if (askFirst('task:' + evt.item.dataset.id)) { if (!drawAfterDrag()) renderList(); return; }
         const ids = [...C.listUl.querySelectorAll('.row')].map((el) => el.dataset.id);
         T.applyReorder(S.data.tasks, ids, evt.item.dataset.id, nowIso());
         save(['tasks']);
-        renderList();
+        if (!drawAfterDrag()) renderList();
         if (S.layout === 'mobile') renderTodayTasks();
       },
     }));
@@ -792,13 +973,16 @@ function setupSortables() {
     });
     S.sortables.schedule = Sortable.create(C.schedUl, Object.assign({}, common, {
       draggable: '.line',
+      onStart: () => { startDrag(); },
       onEnd: (evt) => {
-        if (evt.oldIndex === evt.newIndex) return;
+        S.dragging = false;
+        if (evt.oldIndex === evt.newIndex) { drawAfterDrag(); return; }
+        if (askFirst('schedule:' + S.data.schedule.date)) { if (!drawAfterDrag()) renderSchedule(); return; }
         const ids = [...C.schedUl.querySelectorAll('.line')].map((el) => el.dataset.id);
         const byId = new Map(S.data.schedule.lines.map((l) => [l.id, l]));
         S.data.schedule.lines = ids.map((id) => byId.get(id)).filter(Boolean);
         save(['schedule']);
-        renderSchedule();
+        if (!drawAfterDrag()) renderSchedule();
       },
     }));
   }
@@ -851,6 +1035,7 @@ function withTyped(input, pasted) {
 function addScheduleFromText(text) {
   const s = S.data.schedule;
   if (!String(text).trim()) return;
+  if (askFirst('schedule:' + s.date)) return;
   if (s.lines.length >= PL.SCHEDULE_LIMITS.lines) {
     toast('予定は' + PL.SCHEDULE_LIMITS.lines + '件までです');
     return;
@@ -876,6 +1061,7 @@ function isEditingIn(el) {
 }
 
 function renderSchedule(fromAll) {
+  if (holdForDrag()) return;
   if (fromAll && isEditingIn(C.schedUl)) return;
   const s = S.data.schedule;
   const collapsible = S.layout !== 'mobile';
@@ -900,7 +1086,7 @@ function renderSchedule(fromAll) {
 
 function scheduleLine(l) {
   const li = h('li', { class: 'line', dataset: { id: l.id } });
-  const text = h('button', { type: 'button', class: 'line-body', 'aria-label': l.text + '（押すと書き直せます）', onclick: () => editLineInline(li, l.text, (v) => {
+  const text = h('button', { type: 'button', class: 'line-body', 'aria-label': l.text + '（押すと書き直せます）', onclick: () => askFirst('schedule:' + S.data.schedule.date) || editLineInline(li, l.text, (v) => {
     const line = S.data.schedule.lines.find((x) => x.id === l.id);
     if (!line) return;
     if (!v.trim()) { renderSchedule(); return; }
@@ -909,13 +1095,20 @@ function scheduleLine(l) {
     renderSchedule();
   }, () => renderSchedule()) }, timeText(l.text));
   const del = h('button', { type: 'button', class: 'line-del', 'aria-label': '予定を消す: ' + l.text, onclick: () => {
+    if (askFirst('schedule:' + S.data.schedule.date)) return;
     const lines = S.data.schedule.lines;
     const i = lines.findIndex((x) => x.id === l.id);
     if (i < 0) return;
     const [removed] = lines.splice(i, 1);
     save(['schedule']);
     renderSchedule();
-    toast('予定を消しました', { actionLabel: '元に戻す', onAction: () => { S.data.schedule.lines.splice(i, 0, removed); save(['schedule']); renderSchedule(); }, duration: 5000 });
+    toast('予定を消しました', { actionLabel: '元に戻す', onAction: () => {
+      if (askFirst('schedule:' + S.data.schedule.date)) return;
+      if (S.data.schedule.lines.some((x) => x.id === removed.id)) return;
+      S.data.schedule.lines.splice(Math.min(i, S.data.schedule.lines.length), 0, removed);
+      save(['schedule']);
+      renderSchedule();
+    }, duration: 5000 });
   } }, icon('x'));
   li.append(text, del, h('span', { class: 'grip', 'aria-hidden': 'true' }, icon('grip-vertical')));
   return li;
@@ -965,7 +1158,9 @@ function renderGoals(force) {
       type: 'button',
       class: 'link-btn',
       onclick: () => {
+        if (askFirst('goal:' + kind + ':' + PL.storedKey(S.data.goals, kind))) return;
         S.data.goals[kind].lines.push('');
+        saveGoals();
         renderGoals(true);
         focusGoal(S.data.goals[kind].lines.length - 1);
       },
@@ -994,6 +1189,9 @@ function goalRow(kind, i, line) {
     placeholder: '目標を書く',
     enterkeyhint: 'next',
     'aria-label': PL.GOAL_KIND_LABEL[kind] + 'の目標 ' + (i + 1),
+  });
+  input.addEventListener('focus', () => {
+    if (askFirst('goal:' + kind + ':' + PL.storedKey(S.data.goals, kind))) input.blur();
   });
   input.addEventListener('input', () => {
     const lines = S.data.goals[kind].lines;
@@ -1047,6 +1245,7 @@ function renderWeekGoals() {
 // ---- mobile "today"
 
 function renderTodayTasks() {
+  if (holdForDrag()) return;
   const list = S.data.tasks.filter((t) => T.inSmart('today', t, S.today) || (S.recentlyDone.has(t.id) && t.due === S.today)).sort(T.byOrder);
   const overdue = T.smartCounts(S.data.tasks, S.today).overdue;
   fill(C.todayTasks, 
@@ -1105,11 +1304,14 @@ function openDragonSheet() {
 }
 
 async function renameDragon() {
+  if (askFirst('dragon:name')) return;
   const input = h('input', { type: 'text', class: 'field', value: S.data.dragon.name, maxlength: '20', 'aria-label': '竜の名前' });
+  S.editing.add('dragon:name');
   const sheet = openSheet({
     title: '竜の名前',
     className: 'sheet-small',
     content: h('div', { class: 'card pad' }, input),
+    onClose: () => { S.editing.delete('dragon:name'); },
     onDone: () => {
       const v = input.value.trim();
       if (!v) { toast('名前を入れてください'); return false; }
@@ -1188,7 +1390,7 @@ function renderMemo(fromAll) {
 
 function memoLine(m) {
   const li = h('li', { class: 'line' + (m.taskId ? ' used' : ''), dataset: { id: m.id } });
-  const body = h('button', { type: 'button', class: 'line-body', 'aria-label': m.text + '（押すと書き直せます）', onclick: () => editLineInline(li, m.text, (v) => {
+  const body = h('button', { type: 'button', class: 'line-body', 'aria-label': m.text + '（押すと書き直せます）', onclick: () => askFirst('memo:' + m.id) || editLineInline(li, m.text, (v) => {
     const memo = S.data.memos.find((x) => x.id === m.id);
     if (!memo || !v.trim()) { renderMemo(); return; }
     memo.text = U.clampText(v.trim(), ST.MEMO_TEXT_MAX);
@@ -1197,12 +1399,14 @@ function memoLine(m) {
   }, () => renderMemo()) }, h('span', { class: 'line-text' }, m.text));
   const to = h('button', { type: 'button', class: 'line-to', 'aria-label': 'タスクにする: ' + m.text, title: 'タスクにする', onclick: () => memoToTask(m) }, icon('arrow-right'));
   const del = h('button', { type: 'button', class: 'line-del', 'aria-label': 'メモを消す: ' + m.text, onclick: () => {
+    if (askFirst('memo:' + m.id)) return;
     const memo = S.data.memos.find((x) => x.id === m.id);
     if (!memo) return;
     memo.deletedAt = nowIso();
     save(['memos']);
     renderMemo();
     toast('メモをゴミ箱に移しました', { actionLabel: '元に戻す', onAction: () => {
+      if (askFirst('memo:' + m.id)) return;
       const cur = S.data.memos.find((x) => x.id === m.id);
       if (!cur || cur.purgedAt) return;
       cur.deletedAt = null;
@@ -1215,6 +1419,7 @@ function memoLine(m) {
 }
 
 function memoToTask(m) {
+  if (askFirst('memo:' + m.id)) return;
   if (S.layout === 'mobile') openAddSheet(m.text, m.id);
   else C.quick.setText(m.text, m.id);
 }
@@ -1229,6 +1434,7 @@ function buildBox() {
 }
 
 function renderBox() {
+  if (holdForDrag()) return;
   const parked = S.data.tasks.filter((t) => T.inSmart('parked', t, S.today));
   const dated = parked.filter((t) => t.returnOn).sort((a, b) => a.returnOn.localeCompare(b.returnOn));
   fill(C.boxHead, 
@@ -1508,6 +1714,7 @@ function addMany(list) {
 function toggleDone(id) {
   const t = findTask(id);
   if (!t) return;
+  if (askFirst('task:' + id)) { renderList(); return; }
   if (t.status === 'done') {
     undoComplete(id);
     return;
@@ -1532,6 +1739,7 @@ function toggleDone(id) {
 }
 
 function undoComplete(id) {
+  if (askFirst('task:' + id)) return;
   const t = findTask(id);
   if (!t || t.status !== 'done') return;
   clearTimeout(S.recentlyDone.get(id));
@@ -1576,6 +1784,7 @@ function pickReturnDate() {
 async function askPark(id) {
   const t = findTask(id);
   if (!t || !T.isLive(t)) { renderList(); renderBox(); return; }
+  if (askFirst('task:' + id)) { renderList(); renderBox(); return; }
   const when = await pickReturnDate();
   if (when === undefined) { renderList(); renderBox(); return; }
   parkNow(id, when);
@@ -1590,7 +1799,14 @@ function parkNow(id, when) {
   renderAll();
   toast('あとで箱にしまいました' + (when ? '（' + U.fmtMD(when, thisYear()) + 'に戻ります）' : ''), {
     actionLabel: '元に戻す',
-    onAction: () => { Object.assign(t, before); save(['tasks']); renderAll(); },
+    onAction: () => {
+      if (askFirst('task:' + id)) return;
+      const cur = findTask(id); // the sync may have put new data in meanwhile: the task of now
+      if (!cur || !cur.parked) return;
+      Object.assign(cur, before);
+      save(['tasks']);
+      renderAll();
+    },
     duration: 5000,
   });
 }
@@ -1598,6 +1814,7 @@ function parkNow(id, when) {
 function unparkNow(id) {
   const t = findTask(id);
   if (!t) return;
+  if (askFirst('task:' + id)) return;
   T.unparkTask(t, S.data.tasks, false, nowIso());
   save(['tasks']);
   renderAll();
@@ -1639,6 +1856,7 @@ function openFilterMenu() {
 function openDetail(id) {
   const orig = findTask(id);
   if (!orig) return;
+  if (askFirst('task:' + id)) return;
   if (orig.returnedMark) {
     orig.returnedMark = false;
     save(['tasks']);
@@ -1653,16 +1871,18 @@ function openDetail(id) {
   const body = h('div', { class: 'detail' });
   const people = () => peopleMap();
 
+  S.editing.add('task:' + id);
   const sheet = openSheet({
     title: '詳細',
     content: body,
     className: 'sheet-detail',
+    onClose: () => { S.editing.delete('task:' + id); },
     onDone: () => {
       const cur = findTask(id);
       if (cur && cur.updatedAt !== openedVersion && !overwriteOk) {
         confirmDialog({
           title: '別の画面で変更されています',
-          message: 'このタスクは、詳細を開いたあとに別のタブなどで変更されました。この画面の内容で上書きしますか？',
+          message: 'このタスクは、詳細を開いたあとに変更されました（同期で届いたほかの端末の変更か、別のタブ）。この画面の内容で上書きすると、その変更は消えます（同期中はほかの端末からも消えます）。上書きしますか？',
           okLabel: '上書きする',
           cancelLabel: 'やめる',
           destructive: true,
@@ -1934,7 +2154,13 @@ function trashNow(id) {
   T.trashTask(t, nowIso());
   save(['tasks']);
   renderAll();
-  toast('ゴミ箱に移しました', { actionLabel: '元に戻す', onAction: () => { T.restoreTask(t, nowIso()); save(['tasks']); renderAll(); }, duration: 5000 });
+  toast('ゴミ箱に移しました', { actionLabel: '元に戻す', onAction: () => {
+    if (askFirst('task:' + id)) return;
+    const cur = findTask(id); // the sync may have put new data in meanwhile: the task of now
+    if (!cur || !T.restoreTask(cur, nowIso())) return;
+    save(['tasks']);
+    renderAll();
+  }, duration: 5000 });
 }
 
 /** Choose who a route step is for: kind (確認/依頼/返信) + a round icon tile. */
@@ -1962,7 +2188,7 @@ function pickPerson({ title, kind, whoId }) {
     });
     const sheet = openSheet({
       title,
-      content: [seg, ...groups.flat().filter(Boolean), h('p', { class: 'sub-note' }, '人の名前は 設定 → 相手 で足せます（この端末の中だけに保存）。')],
+      content: [seg, ...groups.flat().filter(Boolean), h('p', { class: 'sub-note' }, '人の名前は 設定 → 相手 で足せます（この端末に保存。同期をオンにすると同期ファイルにも）。')],
       onClose: () => resolve(picked),
     });
   });
@@ -2006,7 +2232,8 @@ function openTrash() {
       h('div', { class: 'trash-main' }, h('div', { class: 'row-title-text' }, label), h('div', { class: 'row-meta' }, sub)),
       h('button', { type: 'button', class: 'mini-btn', onclick: onRestore }, '戻す'),
       h('button', { type: 'button', class: 'mini-btn danger', onclick: onPurge }, '完全に消す'));
-    const purge = async (what, fn) => {
+    const purge = async (what, key, fn) => {
+      if (askFirst(key)) return;
       const ok = await confirmDialog({ title: '完全に消しますか？', message: '「' + what + '」を消します。元に戻せません。', okLabel: '完全に消す', destructive: true });
       if (!ok) return;
       fn();
@@ -2015,26 +2242,28 @@ function openTrash() {
     fill(box, 
       h('p', { class: 'sheet-note' }, '削除したものはここに残ります。自動では消えません。'),
       h('div', { class: 'group-head' }, h('span', { class: 'group-label' }, 'タスク（' + tasks.length + '件）')),
-      tasks.length ? h('ul', { class: 'card' }, tasks.map((t) => item(t.title, '削除 ' + U.fmtDateTime(t.deletedAt),
+      tasks.length ? h('ul', { class: 'card' }, tasks.map((t) => item(t.title, (waitsAnswer('task:' + t.id) ? '要選択・' : '') + '削除 ' + U.fmtDateTime(t.deletedAt),
         () => {
+          if (askFirst('task:' + t.id)) return;
           const cur = findTask(t.id);
           if (!cur || !T.restoreTask(cur, nowIso())) { render(); return; }
           save(['tasks']); renderAll(); render(); toast('タスクを戻しました');
         },
-        () => purge(t.title, () => {
+        () => purge(t.title, 'task:' + t.id, () => {
           const cur = findTask(t.id);
           if (cur && cur.deletedAt && !cur.purgedAt) { T.purgeTask(cur, nowIso()); save(['tasks']); }
           renderAll();
         })))) : h('p', { class: 'empty small' }, 'ありません'),
       h('div', { class: 'group-head' }, h('span', { class: 'group-label' }, 'メモ（' + memos.length + '件）')),
-      memos.length ? h('ul', { class: 'card' }, memos.map((m) => item(m.text, '削除 ' + U.fmtDateTime(m.deletedAt),
+      memos.length ? h('ul', { class: 'card' }, memos.map((m) => item(m.text, (waitsAnswer('memo:' + m.id) ? '要選択・' : '') + '削除 ' + U.fmtDateTime(m.deletedAt),
         () => {
+          if (askFirst('memo:' + m.id)) return;
           const cur = S.data.memos.find((x) => x.id === m.id);
           if (!cur || cur.purgedAt) { render(); return; }
           cur.deletedAt = null;
           save(['memos']); renderMemo(); render(); toast('メモを戻しました');
         },
-        () => purge(m.text, () => {
+        () => purge(m.text, 'memo:' + m.id, () => {
           const cur = S.data.memos.find((x) => x.id === m.id);
           if (cur && cur.deletedAt && !cur.purgedAt) { T.purgeMemo(cur, nowIso()); save(['memos']); }
           renderMemo();
@@ -2104,17 +2333,30 @@ async function importFile(file) {
     return;
   }
   const c = r.counts;
+  const syncing = syncingNow();
   const ok = await confirmDialog({
-    title: 'このファイルで置き換えますか？',
-    message: 'タスク ' + c.tasks + '件・完了 ' + c.done + '件・ゴミ箱 ' + c.trash + '件・メモ ' + c.memos + '件・相手 ' + c.people + '件・目標 ' + c.goals + '行・今日の予定 ' + c.schedule + '行・履歴 ' + c.history + '件・竜の経験値 ' + c.xp + '\n\n今のデータは「読み込み直前の控え」に残します（設定から戻せます）。',
-    okLabel: '置き換える',
+    title: syncing ? 'このファイルの中身で上書きしますか？' : 'このファイルで置き換えますか？',
+    message: 'タスク ' + c.tasks + '件・完了 ' + c.done + '件・ゴミ箱 ' + c.trash + '件・メモ ' + c.memos + '件・相手 ' + c.people + '件・目標 ' + c.goals + '行・今日の予定 ' + c.schedule + '行・履歴 ' + c.history + '件・竜の経験値 ' + c.xp + '\n\n' +
+      (syncing ? 'このファイルの中身で上書きします。同期で他の端末にも反映されます。ファイルに無いものは消しません。' : '') +
+      '今のデータは「読み込み直前の控え」に残します（設定から戻せます）。',
+    okLabel: syncing ? '上書きする' : '置き換える',
     destructive: true,
   });
   if (!ok) return;
-  await replaceAllData(r.data, '読み込みました（タスク ' + c.tasks + '件）');
+  await replaceAllData((cur) => (syncing ? mergeImport(cur, r.data, { today: S.today, at: nowIso() }).state : r.data), '読み込みました（タスク ' + c.tasks + '件）');
 }
 
-async function replaceAllData(newData, message) {
+/** The sync is on (or paused) on this device: reading a file or going back to a copy overwrites and adds (0-2 p). */
+function syncingNow() {
+  return Boolean(S.sync && S.sync.view().connected);
+}
+
+/**
+ * build(current) makes the new data from the app's data of the moment it is saved (with the sync on, the file is
+ * added onto what is there: made before a sync's write, it would put back what the sync had just brought in).
+ */
+async function replaceAllData(build, message) {
+  saveGoals.flush();
   await S.queue;
   try {
     await ST.savePreImport(S.db, S.data, nowIso());
@@ -2122,7 +2364,8 @@ async function replaceAllData(newData, message) {
     await alertDialog({ title: '控えを作れなかったので止めました', message: '今のデータは何も変わっていません。' });
     return false;
   }
-  S.data = newData;
+  await S.queue; // a write of the sync may have come in meanwhile
+  S.data = build(S.data);
   const before = S.data.dragon.total;
   D.settle(S.data.dragon, S.data.tasks, null, nowIso());
   S.data.settings.xpModel = D.XP_MODEL;
@@ -2144,9 +2387,15 @@ async function restoreBackup(b) {
     await alertDialog({ title: '控えが壊れているので戻せません', message: r.error });
     return false;
   }
-  const ok = await confirmDialog({ title: 'この控えに戻しますか？', message: U.fmtDateTime(b.at) + ' の状態（タスク ' + r.counts.tasks + '件）に戻します。今のデータは「読み込み直前の控え」に残します。', okLabel: '戻す', destructive: true });
+  const syncing = syncingNow();
+  const ok = await confirmDialog({
+    title: 'この控えに戻しますか？',
+    message: U.fmtDateTime(b.at) + ' の控え（タスク ' + r.counts.tasks + '件）' + (syncing ? 'の中身で上書きします。同期で他の端末にも反映されます。控えに無いものは消しません。' : 'の状態に戻します。') + '今のデータは「読み込み直前の控え」に残します。',
+    okLabel: '戻す',
+    destructive: true,
+  });
   if (!ok) return false;
-  return replaceAllData(r.data, U.fmtDateTime(b.at) + ' の控えに戻しました');
+  return replaceAllData((cur) => (syncing ? mergeImport(cur, r.data, { today: S.today, at: nowIso() }).state : r.data), U.fmtDateTime(b.at) + ' の控えに戻しました');
 }
 
 /** Leave for the connection test page only after every queued save has been written. */
@@ -2188,6 +2437,7 @@ function openSettings() {
     try { all = await ST.listBackups(S.db); } catch (e) { /* ignore */ }
     const autos = all.filter((b) => b.kind === 'auto').sort((a, b) => b.date.localeCompare(a.date));
     const pre = all.find((b) => b.kind === 'pre');
+    const presync = all.find((b) => b.kind === 'presync');
     fill(backupsBox, 
       h('div', { class: 'group-head' }, h('span', { class: 'group-label' }, '自動の控え（1日1回・' + ST.BACKUP_DAYS + '日分）')),
       autos.length ? h('ul', { class: 'card' }, autos.map((b) => h('li', { class: 'trash-row' },
@@ -2196,7 +2446,11 @@ function openSettings() {
       h('p', { class: 'sub-note' }, 'ブラウザの中の控えです。ブラウザのデータを消すと一緒に消えるので、本命は「書き出す」です。'),
       pre ? h('ul', { class: 'card' }, h('li', { class: 'trash-row' },
         h('div', { class: 'trash-main' }, h('div', {}, '読み込み直前の控え'), h('div', { class: 'row-meta' }, U.fmtDateTime(pre.at) + '・タスク ' + (pre.counts ? pre.counts.tasks : '?') + '件')),
-        h('button', { type: 'button', class: 'mini-btn', onclick: async () => { if (await restoreBackup(pre)) sheet.close(); } }, '元に戻す'))) : null);
+        h('button', { type: 'button', class: 'mini-btn', onclick: async () => { if (await restoreBackup(pre)) sheet.close(); } }, '元に戻す'))) : null,
+      presync ? h('ul', { class: 'card' }, h('li', { class: 'trash-row' },
+        h('div', { class: 'trash-main' }, h('div', {}, '同期を始める前の控え'), h('div', { class: 'row-meta' }, U.fmtDateTime(presync.at) + '・タスク ' + (presync.counts ? presync.counts.tasks : '?') + '件')),
+        h('button', { type: 'button', class: 'mini-btn', onclick: async () => { if (await restoreBackup(presync)) sheet.close(); } }, 'この控えに戻す'))) : null,
+      presync ? h('p', { class: 'sub-note' }, '「同期を始める前の控え」は、この端末が同期データを受け取る直前の中身です。同期中に戻すと、控えの中身を足して（上書きして）ほかの端末にも送ります。控えに無いものは消しません。') : null);
   }
 
   async function renderStorage() {
@@ -2218,12 +2472,14 @@ function openSettings() {
       h('ul', { class: 'card' }, people.map((p) => h('li', {}, h('button', { type: 'button', class: 'person-row', onclick: () => editPerson(p, render) },
         avatar(p, 'sm'), h('span', { class: 'person-row-name' }, p.name), h('span', { class: 'f-hint' }, T.GROUP_LABEL[p.group]), icon('chevron-right')))),
       h('li', {}, h('button', { type: 'button', class: 'person-row add', onclick: () => editPerson(null, render) }, icon('plus'), h('span', {}, '相手を足す')))),
-      h('p', { class: 'sub-note' }, '人の名前や社外の呼び名はここで足します。この端末の中にだけ保存され、どこにも送られません。'),
+      h('p', { class: 'sub-note' }, '人の名前や社外の呼び名はここで足します。この端末に保存されます。同期をオンにすると、Googleドライブの同期ファイルにも保存されます（ほかへは送りません）。'),
+
+      ...(S.sync ? SU.syncSettings(S.sync, syncCtx(), render) : []),
 
       h('div', { class: 'group-head' }, h('span', { class: 'group-label' }, 'バックアップ')),
       h('ul', { class: 'card form' },
         h('li', {}, h('button', { type: 'button', class: 'action', onclick: () => { doExport(); render(); } }, icon('download'), '書き出す（JSONファイル）')),
-        h('li', {}, h('button', { type: 'button', class: 'action', onclick: () => fileInput.click() }, icon('upload'), '読み込む（今のデータと置き換え）')),
+        h('li', {}, h('button', { type: 'button', class: 'action', onclick: () => fileInput.click() }, icon('upload'), syncingNow() ? '読み込む（同期中は上書き＋足す）' : '読み込む（今のデータと置き換え）')),
         h('li', { class: 'form-row' }, h('span', { class: 'f-label' }, '最後の書き出し'), h('span', { class: 'f-hint' }, st.lastExportAt ? U.fmtDateTime(st.lastExportAt) : 'まだありません'))),
       fileInput,
       backupsBox,
@@ -2240,7 +2496,7 @@ function openSettings() {
 
       h('div', { class: 'group-head' }, h('span', { class: 'group-label' }, 'このアプリについて')),
       versionBox,
-      h('p', { class: 'sub-note' }, '実行リスト ' + APP_VERSION + '。データはこの端末のブラウザの中（IndexedDB）にだけ保存されます。外部への送信はしません。PCとスマホは別々の帳簿です（引っ越しは 書き出す → 読み込む）。'),
+      h('p', { class: 'sub-note' }, '実行リスト ' + APP_VERSION + '。データはこの端末のブラウザの中（IndexedDB）に保存されます。同期をオンにしたときだけ、ログインしたアカウントの Google ドライブの同期ファイルとやりとりして、PCとスマホの中身をそろえます（ほかへは送りません）。同期しないときの引っ越しは 書き出す → 読み込む。'),
       h('ul', { class: 'card form' }, h('li', {}, h('a', { class: 'action', href: '/connect-test.html', onclick: openConnectTest }, icon('world'), '接続テスト（同期の準備）'))),
       h('p', { class: 'sub-note' }, 'PCとスマホの同期の準備として、Googleとつながるかを試すページです。そのページだけがGoogleと通信します。タスクやメモは送りません。'));
     renderBackups();
@@ -2252,6 +2508,7 @@ function openSettings() {
 
 function editPerson(p, after) {
   const isNew = !p;
+  if (p && askFirst('person:' + p.id)) return;
   const name = h('input', { type: 'text', class: 'field', value: p ? p.name : '', maxlength: String(T.PERSON_NAME_MAX), placeholder: '名前（例: 部署名や呼び名）', 'aria-label': '名前' });
   let group = p ? p.group : 'team';
   const seg = h('div', { class: 'seg', role: 'group', 'aria-label': '色分け' });
@@ -2260,21 +2517,27 @@ function editPerson(p, after) {
   const del = !isNew ? h('button', { type: 'button', class: 'btn wide danger', onclick: async () => {
     const ok = await confirmDialog({ title: '「' + p.name + '」を消しますか？', message: '選ぶ画面から消えます。すでに確認ルートに入っている段は、そのまま名前で残ります。', okLabel: '消す', destructive: true });
     if (!ok) return;
-    p.deletedAt = nowIso();
+    const cur = S.data.people.find((x) => x.id === p.id); // the sync may have put new data in meanwhile
+    if (cur) cur.deletedAt = nowIso();
     save(['people']);
     sheet.close();
     renderAll();
     if (after) after();
   } }, 'この相手を消す') : null;
+  if (p) S.editing.add('person:' + p.id);
   const sheet = openSheet({
     title: isNew ? '相手を足す' : '相手を変える',
     className: 'sheet-small',
+    onClose: () => { if (p) S.editing.delete('person:' + p.id); },
     content: [h('div', { class: 'card pad' }, name), h('div', { class: 'group-head' }, h('span', { class: 'group-label' }, '色分け（上司・部署内＝藍／他部署＝青緑／社外＝橙）')), seg, del],
     onDone: () => {
       const v = U.clampText(name.value.trim(), T.PERSON_NAME_MAX);
       if (!v) { toast('名前を入れてください'); return false; }
       if (isNew) S.data.people.push(T.newPerson(v, group, null));
-      else { p.name = v; p.group = group; p.initial = T.initialOf(v); }
+      else {
+        const cur = S.data.people.find((x) => x.id === p.id); // the person of now (the sync may have put new data in)
+        if (cur) { cur.name = v; cur.group = group; cur.initial = T.initialOf(v); }
+      }
       save(['people']);
       renderAll();
       if (after) after();
@@ -2300,4 +2563,6 @@ globalThis.jikkoDebug = {
   overlay: () => overlayOpen(),
   phone: () => isPhone(),
   recheckDay: () => dayCheck(true),
+  sync: () => (S.sync ? S.sync.syncNow('debug') : null), // run one sync now (checks)
+  syncView: () => (S.sync ? S.sync.view() : null),
 };

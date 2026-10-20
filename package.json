@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "A personal task list that keeps every piece of data inside the browser (IndexedDB) and opens without a connection.",
+  "description": "A personal task list that keeps its data in the browser (IndexedDB), opens without a connection, and can sync devices through a spreadsheet in the user's own Google Drive.",
   "license": "MIT",
   "scripts": {
     "test": "node --test tests/*.test.js",

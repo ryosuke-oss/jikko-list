@@ -15,7 +15,9 @@ import { newGoals, newSchedule, GOAL_KINDS, GOAL_LIMITS, SCHEDULE_LIMITS } from 
 export const DB_NAME = 'jikko-list';
 // 2 (app 1.3): no new stores. Raising the number makes tabs of older versions close the database and
 // ask for a reload, so they can no longer write data in the old shape (they would drop the new fields).
-export const DB_VERSION = 2;
+// 3: two stores for the sync (not used by the screens yet): `sync` (this device's sync records) and
+// `revs` (the versions read or made, one record per item key). `state` and `backups` are left as they are.
+export const DB_VERSION = 3;
 export const APP_ID = 'jikko-list';
 export const FORMAT = 1;
 export const KEYS = ['tasks', 'people', 'memos', 'goals', 'goalLog', 'schedule', 'scheduleLog', 'dragon', 'settings'];
@@ -331,13 +333,16 @@ export function exportFileName(d) {
 
 export class ConflictError extends Error {}
 
-export function openDb() {
+/** Opens (and when needed upgrades) the database. Upgrading only adds missing stores; nothing is removed. */
+export function openDb(factory) {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    const req = (factory || globalThis.indexedDB).open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains('state')) db.createObjectStore('state');
       if (!db.objectStoreNames.contains('backups')) db.createObjectStore('backups', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('sync')) db.createObjectStore('sync');
+      if (!db.objectStoreNames.contains('revs')) db.createObjectStore('revs', { keyPath: 'key' });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error || new Error('IndexedDB を開けませんでした'));
@@ -433,6 +438,128 @@ export async function autoBackup(db, data, today, at) {
 /** The copy taken right before an import or a restore (only one is kept). */
 export function savePreImport(db, data, at) {
   return putBackup(db, { id: 'pre-import', kind: 'pre', date: at.slice(0, 10), at, counts: countsOf(data), data: snapshot(data) });
+}
+
+/** The copy taken right before this device receives the sync data (a slot of its own: never mixed with the one above). */
+export function savePreSync(db, data, at) {
+  return putBackup(db, { id: 'pre-sync', kind: 'presync', date: at.slice(0, 10), at, counts: countsOf(data), data: snapshot(data) });
+}
+
+// ---- Sync records (this device only; written by the sync engine) ----
+// sync store, out-of-line keys: 'config' (on / paused, ids, the key to Google...), 'progress' (rows read per tab,
+// versions waiting to be sent, questions...), 'applied' (per item: the version shown on the screen and a hash
+// of its content). revs store: { key: 'task:<id>', v: { [version name]: { p, c, ... } } }.
+
+export const SYNC_PARTS = ['config', 'progress', 'applied'];
+
+function syncTx(db, stores, mode, fn) {
+  return new Promise((resolve, reject) => {
+    const t = db.transaction(stores, mode);
+    let out;
+    fn(t, (v) => { out = v; });
+    t.oncomplete = () => resolve(out);
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error || new Error('abort'));
+  });
+}
+
+/** { config, progress, applied } (each undefined when not written yet). */
+export function loadSync(db) {
+  return syncTx(db, ['sync'], 'readonly', (t, set) => {
+    const st = t.objectStore('sync');
+    const out = {};
+    for (const k of SYNC_PARTS) {
+      const r = st.get(k);
+      r.onsuccess = () => { out[k] = r.result; };
+    }
+    set(out);
+  });
+}
+
+function putSyncParts(t, parts, revs) {
+  const st = t.objectStore('sync');
+  for (const k of SYNC_PARTS) if (parts && parts[k] !== undefined) st.put(parts[k], k);
+  const rv = t.objectStore('revs');
+  for (const r of revs || []) rv.put(r);
+}
+
+/** Writes sync records and version records together (one transaction). The app's data is not touched. */
+export function saveSync(db, parts, revs) {
+  return syncTx(db, ['sync', 'revs'], 'readwrite', (t) => putSyncParts(t, parts, revs));
+}
+
+/** Version records of the given item keys: Map key -> record (missing keys are left out). */
+export function getRevs(db, keys) {
+  return syncTx(db, ['revs'], 'readonly', (t, set) => {
+    const st = t.objectStore('revs');
+    const out = new Map();
+    for (const k of new Set(keys)) {
+      const r = st.get(k);
+      r.onsuccess = () => { if (r.result) out.set(k, r.result); };
+    }
+    set(out);
+  });
+}
+
+export function getAllRevs(db) {
+  return syncTx(db, ['revs'], 'readonly', (t, set) => {
+    const r = t.objectStore('revs').getAll();
+    r.onsuccess = () => set(r.result || []);
+  });
+}
+
+/**
+ * The app's data (given keys) together with the sync records in ONE transaction, so the version shown on the
+ * screen never moves without the data. When another tab saved in between, nothing is written (ConflictError).
+ */
+export function commitSync(db, data, keys, expectedRev, parts, revs) {
+  return new Promise((resolve, reject) => {
+    const t = db.transaction(['state', 'sync', 'revs'], 'readwrite');
+    const st = t.objectStore('state');
+    let newRev = null;
+    let conflict = false;
+    const r = st.get('rev');
+    r.onsuccess = () => {
+      const cur = r.result || 0;
+      if (cur !== expectedRev) {
+        conflict = true;
+        t.abort();
+        return;
+      }
+      newRev = cur + 1;
+      for (const k of keys) st.put(data[k], k);
+      st.put(newRev, 'rev');
+      putSyncParts(t, parts, revs);
+    };
+    t.oncomplete = () => resolve(newRev);
+    t.onabort = () => reject(conflict ? new ConflictError('conflict') : (t.error || new Error('保存できませんでした')));
+  });
+}
+
+/**
+ * "この端末を外す": this device's sync records go (the `sync` and `revs` stores are emptied, then `keep` is written as
+ * the config). The app's data (`state`) and the copies (`backups`) are not touched.
+ */
+export function resetSync(db, keep) {
+  return syncTx(db, ['sync', 'revs'], 'readwrite', (t) => {
+    t.objectStore('sync').clear();
+    t.objectStore('revs').clear();
+    if (keep) t.objectStore('sync').put(keep, 'config');
+  });
+}
+
+/** What the sync engine needs from the database, in one object (tests give it a database of their own). */
+export function syncStorage(db) {
+  return {
+    loadState: () => loadState(db),
+    loadSync: () => loadSync(db),
+    saveSync: (parts, revs) => saveSync(db, parts, revs),
+    getRevs: (keys) => getRevs(db, keys),
+    getAllRevs: () => getAllRevs(db),
+    commit: (data, keys, expectedRev, parts, revs) => commitSync(db, data, keys, expectedRev, parts, revs),
+    savePreSync: (data, at) => savePreSync(db, data, at),
+    reset: (keep) => resetSync(db, keep),
+  };
 }
 
 // ---- Storage protection ----

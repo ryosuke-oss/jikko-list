@@ -14,6 +14,8 @@ test('the service worker keeps exactly the files of the app (run `npm run stamp`
   assert.ok(sw.files.includes('/'));
   assert.ok(sw.files.includes('/js/app.js'));
   assert.ok(sw.files.includes('/vendor/Sortable.min.js'));
+  // the sync parts (3-2) are kept on the device too, so they work without a connection
+  for (const f of ['rev', 'merge', 'records', 'engine', 'google', 'control', 'ui']) assert.ok(sw.files.includes('/js/sync/' + f + '.js'), f);
   for (const f of sw.files) assert.ok(existsSync(join(PUBLIC, f === '/' ? 'index.html' : f.slice(1))), f);
   // every file of the site is either kept or left out on purpose
   const leftOut = publicFiles(PUBLIC).filter((p) => !sw.files.includes(p === '/index.html' ? '/' : p));
@@ -34,14 +36,17 @@ test('the service worker never handles other sites or the connection test page',
   assert.doesNotMatch(text, /importScripts|eval\(|googleapis/);
 });
 
-test('the headers allow the service worker and keep sw.js fresh; the app still talks only to its own site', () => {
+test('the headers allow the service worker and keep sw.js fresh; the app talks to its own site and the two Google API hosts only', () => {
   const headers = readFileSync(join(PUBLIC, '_headers'), 'utf8');
   const global = headers.split('\n').find((l) => l.startsWith('  Content-Security-Policy:'));
-  assert.match(global, /connect-src 'self'; worker-src 'self';/);
-  assert.doesNotMatch(global, /googleapis/);
+  // 3-3: the sync talks to Google's two API hosts (7-1 of the spec); the sign-in screen is a page move, not a request
+  assert.match(global, /connect-src 'self' https:\/\/sheets\.googleapis\.com https:\/\/www\.googleapis\.com; worker-src 'self';/);
+  assert.doesNotMatch(global, /accounts\.google\.com|\*/);
+  assert.match(global, /script-src 'self';/);
+  assert.match(global, /form-action 'none'/);
   assert.match(headers, /\/sw\.js\n  Cache-Control: no-cache/);
   const meta = /http-equiv="Content-Security-Policy"\s+content="([^"]+)"/.exec(readFileSync(join(PUBLIC, 'index.html'), 'utf8'))[1];
-  assert.match(meta, /connect-src 'self'; worker-src 'self';/);
+  assert.match(meta, /connect-src 'self' https:\/\/sheets\.googleapis\.com https:\/\/www\.googleapis\.com; worker-src 'self';/);
   // the meta copy says the same as the header (frame-ancestors only works as a header)
   assert.equal(meta, global.replace('  Content-Security-Policy: ', '').replace("; frame-ancestors 'none'", ''));
 });

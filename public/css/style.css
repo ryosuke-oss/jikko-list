@@ -215,6 +215,30 @@ a { color: var(--accent); text-decoration: none; }
 .chip.c-suggest { border: 1px dashed var(--indigo); color: var(--indigo); background: transparent; padding: 4px 10px; }
 .chip.on { background: var(--accent-soft); color: var(--accent); padding-right: 6px; }
 .chip.on .i { font-size: 13px; }
+/* 期日・ランク・所要期間 under the quick-add line (needed for every new task) */
+.qa-need { margin-top: 10px; display: grid; gap: 10px; }
+.qa-pickers { display: grid; gap: 8px; }
+.qa-group { display: grid; grid-template-columns: 4.8em minmax(0, 1fr); align-items: center; gap: 8px; }
+.qa-label { font-size: var(--fs-foot); font-weight: 600; color: var(--text2); }
+.qa-group.missing .qa-label { color: var(--red); }
+.qa-group.missing .qa-opts, .qa-group.missing .qa-seg { box-shadow: 0 0 0 1.5px var(--red); border-radius: 10px; }
+.qa-opts { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.qa-opt { display: inline-flex; align-items: baseline; gap: 4px; padding: 6px 11px; border-radius: 999px; background: var(--bg); color: var(--text); font-size: var(--fs-foot); font-weight: 600; min-height: 32px; }
+.sheet .qa-opt { background: var(--card); }
+.qa-opt.on { background: var(--accent); color: #fff; }
+.qa-sub { font-size: var(--fs-cap); font-weight: 400; color: var(--text2); }
+.qa-opt.on .qa-sub { color: rgba(255, 255, 255, .85); }
+.qa-date { font-size: var(--fs-callout); padding: 3px 10px; border-radius: 999px; background: var(--bg); color: var(--text); border: 0; min-height: 32px; max-width: 100%; }
+.sheet .qa-date { background: var(--card); }
+.qa-date.on { box-shadow: 0 0 0 2px var(--accent); color: var(--accent); font-weight: 600; }
+.qa-seg { max-width: 440px; }
+.qa-seg .seg-btn.on.r-A { color: var(--indigo); }
+.qa-seg .seg-btn.on.r-B { color: var(--teal-text); }
+.qa-seg .seg-btn.on.r-C { color: var(--yellow-text); }
+.qa-foot { display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex-wrap: wrap; }
+.qa-status { font-size: var(--fs-foot); color: var(--text2); margin-right: auto; }
+.qa-status.ok { color: var(--accent); font-weight: 600; }
+.bulk-common { margin: 12px 0; display: grid; gap: 8px; }
 
 /* ---------- smart list tiles ---------- */
 .tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 12px 0 4px; }

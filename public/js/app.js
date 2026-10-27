@@ -25,7 +25,7 @@ if (AUTH_RETURN) history.replaceState(null, '', location.pathname);
 const TAB_ID = U.uid();
 const UI_KEY = 'jikko-list.ui';
 // Shown in the settings. Changing it (or any file under public/) needs `npm run stamp` (tests check it).
-const APP_VERSION = 'v1.4';
+const APP_VERSION = 'v1.5';
 
 const S = {
   db: null,
@@ -1448,19 +1448,92 @@ function renderBox() {
     dated.length ? h('span', { class: 'dz-next' }, U.fmtMD(dated[0].returnOn, thisYear()) + ' に戻る分があります') : null);
 }
 
+// ---------------------------------------------------------------- 期日・ランク・所要期間 (needed for every new task)
+
+// What adds a task from the keyboard (2026-10-27: Enter alone does not, the IME's Enter made it look like nothing
+// happened): ⌘Enter on a Mac / iPhone / iPad, Ctrl+Enter elsewhere (both work everywhere).
+const ADD_KEY = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || '') ? '⌘Enter' : 'Ctrl+Enter';
+
+/** The due dates offered as buttons: today, tomorrow, this week's Friday (when later than tomorrow), next week's Friday. */
+function quickDates(today) {
+  const fri = U.addDays(U.mondayOf(today), 4);
+  const out = [
+    { ymd: today, label: '今日' },
+    { ymd: U.addDays(today, 1), label: '明日' },
+  ];
+  if (fri > U.addDays(today, 1)) out.push({ ymd: fri, label: '今週金' });
+  out.push({ ymd: U.addDays(fri, 7), label: '来週金' });
+  return out;
+}
+
+/**
+ * The buttons for 期日・ランク・所要期間. Built once (again when the day changes), then only their states change, so
+ * a date being picked is never rebuilt under the finger. onPick(type, value): a date (YYYY-MM-DD), a rank or a duration.
+ */
+function createFieldPickers({ onPick }) {
+  const el = h('div', { class: 'qa-pickers' });
+  let builtFor = null;
+  let ui = null;
+  let last = [null, false]; // what render() was last given (to draw again when the day has changed)
+  function build() {
+    builtFor = S.today;
+    const quick = quickDates(S.today).map((q) => Object.assign({}, q, {
+      btn: h('button', {
+        type: 'button',
+        class: 'qa-opt',
+        // the day changed since the buttons were drawn (a sheet left open past midnight): draw the new days first
+        onclick: () => { if (builtFor !== S.today) render(...last); else onPick('due', q.ymd); },
+      }, q.label, h('span', { class: 'qa-sub' }, U.fmtMD(q.ymd, thisYear()))),
+    }));
+    const date = h('input', { type: 'date', class: 'qa-date', 'aria-label': '期日を日付で選ぶ' });
+    // a year typed digit by digit passes through 0002, 0020, 0202: only a whole year is taken
+    date.addEventListener('change', () => { if (U.isYmd(date.value) && /^20\d\d-/.test(date.value)) onPick('due', date.value); });
+    const seg = (type, values, label) => values.map((v) => ({ value: v, btn: h('button', { type: 'button', class: 'seg-btn', onclick: () => onPick(type, v) }, label(v)) }));
+    const rank = seg('rank', T.RANKS, (r) => T.RANK_LABEL[r]);
+    const dur = seg('duration', T.DURATIONS, (d) => T.DURATION_LABEL[d]);
+    const group = (key, label, control) => h('div', { class: 'qa-group', role: 'group', 'aria-label': label, dataset: { field: key } }, h('span', { class: 'qa-label' }, label), control);
+    const groups = {
+      due: group('due', '期日', h('div', { class: 'qa-opts' }, quick.map((q) => q.btn), date)),
+      rank: group('rank', 'ランク', h('div', { class: 'seg qa-seg' }, rank.map((x) => x.btn))),
+      duration: group('duration', '所要期間', h('div', { class: 'seg qa-seg' }, dur.map((x) => x.btn))),
+    };
+    ui = { quick, date, rank, dur, groups };
+    fill(el, groups.due, groups.rank, groups.duration);
+  }
+  /** Show the chosen values. mark: show the missing ones in red (追加 was pressed with them missing). */
+  function render(fields, mark) {
+    last = [fields, mark];
+    if (builtFor !== S.today) build();
+    const f = fields || {};
+    const on = (btn, yes) => { btn.classList.toggle('on', yes); btn.setAttribute('aria-pressed', String(yes)); };
+    ui.quick.forEach((q) => on(q.btn, f.due === q.ymd));
+    ui.date.classList.toggle('on', Boolean(f.due) && !ui.quick.some((q) => q.ymd === f.due));
+    if (document.activeElement !== ui.date) ui.date.value = f.due || '';
+    ui.rank.forEach((x) => { on(x.btn, f.rank === x.value); x.btn.classList.toggle('r-' + x.value, f.rank === x.value); });
+    ui.dur.forEach((x) => on(x.btn, f.duration === x.value));
+    for (const r of P.REQUIRED) ui.groups[r.key].classList.toggle('missing', Boolean(mark) && !f[r.key]);
+  }
+  return { el, render };
+}
+
 // ---------------------------------------------------------------- quick add
 
-function createQuickAdd({ onAdded }) {
+/** inSheet: the add sheet of the phone layout (the buttons always show; the sheet's own 追加 adds). */
+function createQuickAdd({ onAdded, inSheet }) {
   let removed = new Set();
+  let picked = new Set(); // words written by the buttons ("word#n"): their chip's × takes the word out of the line
   let suggestion = 'off'; // off | applied | dismissed
   let memoId = null;
   let parsed = null;
+  let tried = false; // adding was tried with something missing: the missing ones are shown in red
+  let hint = ''; // "Enter だけでは追加しません" after a plain Enter
+  let addAfterIme = 0; // when ⌘Enter came while the IME was still converting: add once the conversion is confirmed
 
   const input = h('input', {
     type: 'text',
     class: 'qa-input',
     placeholder: '新しいタスク　例）研修資料の改訂 木曜 B 3日 教育部に確認',
-    'aria-label': '新しいタスク（1行で書いてEnter）',
+    'aria-label': '新しいタスク（書いて ' + ADD_KEY + ' で追加）',
     maxlength: '400',
     enterkeyhint: 'done',
     autocomplete: 'off',
@@ -1470,15 +1543,69 @@ function createQuickAdd({ onAdded }) {
   const err = h('div', { class: 'qa-error', role: 'alert' });
   const bulk = h('button', { type: 'button', class: 'qa-bulk', 'aria-label': 'まとめて追加（複数行を貼り付け）', title: 'まとめて追加', onclick: () => openBulkSheet(input.value) }, icon('clipboard-text'));
   const field = h('div', { class: 'qa-field' }, icon('plus', 'qa-plus'), input, bulk);
-  const el = h('div', { class: 'quickadd' }, field, chips, err);
+  const pickers = createFieldPickers({
+    onPick: (type, value) => {
+      // the chosen value goes into the line as a word (replacing the word read for it), so the line, the chips and
+      // the buttons always say the same thing
+      const word = type === 'due' ? P.dueWord(value, S.today) : type === 'duration' ? P.DURATION_WORD[value] : value;
+      if (!word) return;
+      const tokens = P.tokenize(input.value, parseOpts());
+      const place = P.placeFieldWord(tokens, type, word);
+      setWords(place.raws, place.from, tokens.map((t) => t.raw), place.index);
+      hint = '';
+      err.textContent = '';
+      reparse();
+      // back to the end of the line, so that ⌘Enter works at once (Safari keeps no focus on a clicked button) and
+      // what is typed next starts a new word; not on the phone (the keyboard would cover the buttons), not from the
+      // date field (it may still be typed into)
+      const a = document.activeElement;
+      if (S.layout !== 'mobile' && !(a && a.classList && a.classList.contains('qa-date'))) {
+        input.focus();
+        input.setSelectionRange(input.value.length, input.value.length);
+      }
+    },
+  });
+  const status = h('span', { class: 'qa-status', 'aria-live': 'polite' });
+  const addBtn = inSheet ? null : h('button', { type: 'button', class: 'btn small primary qa-add', onclick: () => { submit(); } }, '追加');
+  const need = h('div', { class: 'qa-need', hidden: !inSheet }, pickers.el, h('div', { class: 'qa-foot' }, status, addBtn));
+  const el = h('div', { class: 'quickadd' + (inSheet ? ' in-sheet' : '') }, field, chips, need, err);
 
-  function signatures(tokens) {
-    const seen = new Map();
-    return tokens.map((t) => {
-      const n = (seen.get(t.raw) || 0) + 1;
-      seen.set(t.raw, n);
-      return t.raw + '#' + n;
+  function parseOpts() {
+    return { today: S.today, people: activePeople(), removed };
+  }
+
+  /**
+   * The app rewrote the line (a button's word put in or taken out): the other words keep their marks (turned back
+   * into the title / written by a button) even when the same word appears twice. raws: the new words; from[k]: where
+   * word k was in oldRaws (-1: new); pickedAt: the button's new word (-1: none). A space is left at the end, so what
+   * is typed next starts a new word.
+   */
+  function setWords(raws, from, oldRaws, pickedAt) {
+    const oldSig = P.signatures(oldRaws);
+    const newSig = P.signatures(raws);
+    const nextRemoved = new Set();
+    const nextPicked = new Set();
+    raws.forEach((r, k) => {
+      const o = from[k];
+      if (o >= 0 && removed.has(oldSig[o])) nextRemoved.add(newSig[k]);
+      if ((o >= 0 && picked.has(oldSig[o])) || k === pickedAt) nextPicked.add(newSig[k]);
     });
+    removed = nextRemoved;
+    picked = nextPicked;
+    input.value = raws.length ? raws.join(' ') + ' ' : '';
+    if (!raws.length) { suggestion = 'off'; memoId = null; tried = false; }
+  }
+
+  function renderNeed() {
+    const show = Boolean(inSheet) || input.value.trim() !== '';
+    need.hidden = !show;
+    if (!show) return;
+    const f = parsed || {};
+    pickers.render(f, tried);
+    const miss = P.missingFields(f);
+    status.classList.toggle('ok', miss.length === 0);
+    status.textContent = (hint ? hint + ' ' : '') + (miss.length ? '未選択: ' + miss.join('・')
+      : inSheet ? '［追加］で追加します' : ADD_KEY + ' か［追加］で追加します');
   }
 
   function reparse() {
@@ -1486,18 +1613,17 @@ function createQuickAdd({ onAdded }) {
     if (!text.trim()) {
       parsed = null;
       fill(chips);
+      renderNeed();
       return;
     }
-    const opts = { today: S.today, people: activePeople() };
-    const tokens = P.tokenize(text, opts);
-    const sig = signatures(tokens);
-    tokens.forEach((t, i) => { if (removed.has(sig[i]) && t.type !== 'title') tokens[i] = { raw: t.raw, type: 'title', value: null }; });
+    const tokens = P.tokenize(text, parseOpts());
     parsed = P.summarize(tokens, S.today);
     const boss = T.bossFor(S.data.people);
     if (suggestion === 'applied' && boss && parsed.rank === 'A' && !parsed.steps.length) {
       parsed = P.withSuggestedStep(parsed, { kind: 'confirm', whoId: boss.id, note: '方向性確認' }, S.today);
     }
     renderChips(boss);
+    renderNeed();
   }
 
   function chip(label, cls, onRemove, extra) {
@@ -1512,9 +1638,17 @@ function createQuickAdd({ onAdded }) {
     if (t.synthetic) {
       suggestion = 'dismissed';
     } else {
-      const sig = signatures(parsed.tokens.filter((x) => !x.synthetic));
-      const idx = parsed.tokens.filter((x) => !x.synthetic).indexOf(t);
-      removed.add(sig[idx]);
+      const typed = parsed.tokens.filter((x) => !x.synthetic);
+      const raws = typed.map((x) => x.raw);
+      const sig = P.signatures(raws);
+      const idx = typed.indexOf(t);
+      if (picked.has(sig[idx])) {
+        // a button wrote this word: it goes out of the line (it was never part of the name)
+        const keep = raws.map((_, k) => k).filter((k) => k !== idx);
+        setWords(keep.map((k) => raws[k]), keep, raws, -1);
+      } else {
+        removed.add(sig[idx]);
+      }
     }
     reparse();
     input.focus();
@@ -1547,28 +1681,64 @@ function createQuickAdd({ onAdded }) {
     fill(chips, ...out);
   }
 
+  /** Adds the task when the name and 期日・ランク・所要期間 are all there. Returns true when it was added. */
   function submit() {
+    hint = '';
     reparse();
     err.textContent = '';
-    if (!parsed) { err.textContent = 'タスク名を入れてください'; return; }
+    if (!parsed) { err.textContent = 'タスク名を入れてください'; return false; }
     const e = P.lineError(parsed);
-    if (e) { err.textContent = e; return; }
+    if (e) { err.textContent = e; return false; }
+    const miss = P.missingFields(parsed);
+    if (miss.length) {
+      tried = true;
+      renderNeed();
+      err.textContent = miss.join('・') + 'を選んでから追加してください';
+      return false;
+    }
     const id = addTask(parsed, memoId);
     input.value = '';
     removed = new Set();
+    picked = new Set();
     suggestion = 'off';
     memoId = null;
+    tried = false;
     reparse();
+    // ready for the next one (the buttons hide with the empty line, and a focused button would take the focus away)
+    if (S.layout !== 'mobile') input.focus();
     if (onAdded) onAdded(id);
+    return true;
   }
 
   input.addEventListener('input', () => {
     err.textContent = '';
-    if (!input.value.trim()) { removed = new Set(); suggestion = 'off'; memoId = null; }
+    hint = '';
+    if (!input.value.trim()) { removed = new Set(); picked = new Set(); suggestion = 'off'; memoId = null; tried = false; }
     reparse();
   });
+  // ⌘Enter / Ctrl+Enter adds, from the line or from any of the buttons and the date field below it
+  el.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || !(e.metaKey || e.ctrlKey)) return;
+    e.preventDefault();
+    if (e.isComposing) { addAfterIme = Date.now(); return; } // the IME still has the last word: after it lets go
+    if (e.keyCode === 229) { setTimeout(() => { submit(); }, 0); return; } // Safari: the conversion ended just before
+    submit();
+  });
+  input.addEventListener('compositionend', () => {
+    const at = addAfterIme;
+    addAfterIme = 0;
+    // a ⌘Enter left waiting longer than that is dropped (it must not add the task at some later conversion)
+    if (at && Date.now() - at < 5000) setTimeout(() => { submit(); }, 0); // after the confirmed word is in the line
+  });
+  // Enter alone does not add: on a computer it says how to add; on a phone it puts the keyboard away (the buttons and
+  // the sheet's 追加 come into view)
   input.addEventListener('keydown', (e) => {
-    if (isPlainEnter(e)) { e.preventDefault(); submit(); }
+    if (!isPlainEnter(e) || e.metaKey || e.ctrlKey) return;
+    e.preventDefault();
+    if (S.layout === 'mobile') { input.blur(); return; }
+    if (!input.value.trim()) return;
+    hint = 'Enter だけでは追加しません。';
+    renderNeed();
   });
   input.addEventListener('paste', (e) => {
     const text = e.clipboardData ? e.clipboardData.getData('text') : '';
@@ -1577,22 +1747,22 @@ function createQuickAdd({ onAdded }) {
       openBulkSheet(text);
     }
   });
+  if (inSheet) renderNeed(); // the sheet shows the buttons from the start
 
   return {
     el,
     input,
     /** Adds the line. Returns true when a task was added. */
-    submit() {
-      const before = input.value;
-      submit();
-      return before.trim() !== '' && input.value === '';
-    },
-    refresh() { if (input.value.trim()) reparse(); },
+    submit: () => submit(),
+    refresh() { if (input.value.trim() || inSheet) reparse(); },
     setText(text, fromMemo) {
       input.value = text;
       memoId = fromMemo || null;
       removed = new Set();
+      picked = new Set();
       suggestion = 'off';
+      tried = false;
+      hint = '';
       err.textContent = '';
       reparse();
       input.focus();
@@ -1626,11 +1796,11 @@ function addTask(p, memoId) {
 }
 
 function openAddSheet(text, memoId) {
-  const qa = createQuickAdd({ onAdded: () => { /* keep the sheet open for the next one */ } });
+  const qa = createQuickAdd({ inSheet: true, onAdded: () => { /* ⌘Enter from a keyboard: the sheet stays open for the next one */ } });
   const sheet = openSheet({
     title: '新しいタスク',
     className: 'sheet-add',
-    content: [qa.el, h('p', { class: 'sub-note' }, '例）研修資料の改訂 木曜 B 3日 教育部に確認 → タスク名・期日・ランク・所要期間・確認ルートに分けて入ります。続けて何件でも追加できます。')],
+    content: [qa.el, h('p', { class: 'sub-note' }, '期日・ランク・所要期間を選んでから［追加］を押します。1行に「研修資料の改訂 木曜 B 3日 教育部に確認」のように書いても、それぞれに分けて入ります。')],
     cancelLabel: '閉じる',
     onDone: () => (qa.input.value.trim() ? qa.submit() : true),
     doneLabel: '追加',
@@ -1656,19 +1826,49 @@ function openBulkSheet(initial) {
     p.steps.forEach((s, i) => { const who = peopleById.get(s.whoId); parts.push(circled(i + 1) + (who ? who.name : '?') + '（' + T.KIND_LABEL[s.kind] + '）'); });
     return parts.join('・');
   }
+  // 期日・ランク・所要期間 for the lines that do not say them (every new task needs all three)
+  const common = { due: null, rank: null, duration: null };
+  const fieldsOf = (p) => Object.assign({}, p, { due: p.due || common.due, rank: p.rank || common.rank, duration: p.duration || common.duration });
+  function errorOf(r) {
+    if (r.lineError) return r.lineError;
+    const miss = P.missingFields(fieldsOf(r.parsed));
+    return miss.length ? miss.join('・') + 'がありません（上で選ぶか、行に書いてください）' : '';
+  }
+  const pickers = createFieldPickers({
+    onPick: (type, value) => {
+      common[type] = common[type] === value ? null : value; // the chosen one pressed again: taken off
+      // a line that can be added now is checked, unless the person took its check off; the others keep their check
+      for (const r of rows) {
+        const before = r.error;
+        r.error = errorOf(r);
+        if (before && !r.error && !r.userOff) r.checked = true;
+        if (r.error) r.checked = false;
+      }
+      pickers.render(common, false);
+      draw();
+    },
+  });
   function refresh() {
-    rows = P.parseBulk(ta.value, { today: S.today, people: activePeople() }).map((r) => Object.assign(r, { checked: !r.error }));
+    rows = P.parseBulk(ta.value, { today: S.today, people: activePeople() }).map((r) => {
+      const row = Object.assign(r, { lineError: r.error });
+      row.error = errorOf(row);
+      row.checked = !row.error;
+      return row;
+    });
+    draw();
+  }
+  function draw() {
     fill(listEl, ...rows.map((r) => h('li', { class: 'bulk-row' + (r.error ? ' bad' : '') },
       h('input', {
         type: 'checkbox',
         checked: r.checked,
         disabled: Boolean(r.error),
         'aria-label': r.line,
-        onchange: (e) => { r.checked = e.target.checked; updateInfo(); },
+        onchange: (e) => { r.checked = e.target.checked; r.userOff = !r.checked; updateInfo(); },
       }),
       h('div', { class: 'bulk-main' },
         h('div', { class: 'bulk-title' }, r.parsed.title || '（タスク名なし）'),
-        summary(r.parsed) ? h('div', { class: 'bulk-meta' }, summary(r.parsed)) : null,
+        summary(fieldsOf(r.parsed)) ? h('div', { class: 'bulk-meta' }, summary(fieldsOf(r.parsed))) : null,
         r.error ? h('div', { class: 'qa-error' }, r.error) : null))));
     listEl.hidden = rows.length === 0;
     updateInfo();
@@ -1682,15 +1882,21 @@ function openBulkSheet(initial) {
   openSheet({
     title: 'まとめて追加',
     doneLabel: '追加',
-    content: [h('div', { class: 'card pad' }, ta), info, listEl],
+    content: [
+      h('div', { class: 'card pad' }, ta),
+      h('div', { class: 'bulk-common' }, h('p', { class: 'sub-note' }, '期日・ランク・所要期間を書いていない行には、ここで選んだ値が入ります（どのタスクにも3つとも必要です）。'), pickers.el),
+      info,
+      listEl,
+    ],
     onDone: () => {
       refreshSoon.flush(); // only re-reads the text when it was just edited (keeps unchecked rows unchecked)
       const sel = rows.filter((r) => r.checked && !r.error);
       if (!sel.length) { toast('追加するタスクがありません'); return false; }
-      addMany(sel.map((r) => r.parsed));
+      addMany(sel.map((r) => fieldsOf(r.parsed)));
       return true;
     },
   });
+  pickers.render(common, false);
   refresh();
   ta.focus();
 }

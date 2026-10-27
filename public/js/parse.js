@@ -111,16 +111,39 @@ function joinWeekWords(words) {
   return out;
 }
 
-/** Split one line into classified tokens. */
+/**
+ * "word#n" for each word (the n-th time the same word appears in the line): how a word the person turned back into
+ * the title is remembered while the line is being edited.
+ */
+export function signatures(raws) {
+  const seen = new Map();
+  return raws.map((r) => {
+    const n = (seen.get(r) || 0) + 1;
+    seen.set(r, n);
+    return r + '#' + n;
+  });
+}
+
+/**
+ * Split one line into classified tokens. opts.removed: signatures of words the person turned back into the title
+ * (they stay in the title and leave the field to a later word).
+ */
 export function tokenize(text, opts) {
   const today = opts.today;
   const keys = personKeys(opts.people);
   const words = joinWeekWords(String(text || '').split(SPLIT_RE).filter(Boolean));
+  const removed = opts.removed && opts.removed.size ? opts.removed : null;
+  const sigs = removed ? signatures(words) : null;
   const tokens = [];
   const seen = { rank: false, due: false, duration: false };
   let steps = 0;
 
-  for (const raw of words) {
+  for (let k = 0; k < words.length; k += 1) {
+    const raw = words[k];
+    if (removed && removed.has(sigs[k])) {
+      tokens.push({ raw, type: 'title', value: null });
+      continue;
+    }
     const w = norm(raw).replace(/\s+/g, '');
     const up = w.toUpperCase();
     if (!seen.rank && /^[ABC]$/.test(up)) {
@@ -191,6 +214,56 @@ export function withTokenAsTitle(parsed, index, today) {
 export function withSuggestedStep(parsed, step, today) {
   const tokens = parsed.tokens.concat([{ raw: '', type: 'step', value: step, synthetic: true }]);
   return summarize(tokens, today);
+}
+
+// What every new task needs besides its name (2026-10-27): chosen when it is added, not afterwards.
+export const REQUIRED = Object.freeze([
+  { key: 'due', label: '期日' },
+  { key: 'rank', label: 'ランク' },
+  { key: 'duration', label: '所要期間' },
+]);
+
+/** The labels of what is still missing, in that order (empty when the task can be added). */
+export function missingFields(fields) {
+  return REQUIRED.filter((f) => !fields || !fields[f.key]).map((f) => f.label);
+}
+
+/** The word written into the line for each duration (read back by the parser). */
+export const DURATION_WORD = Object.freeze({ '1d': '1日', '3d': '3日', '1w': '1週間', '1m': '1ヶ月' });
+
+/**
+ * The word for a due date: M/D, or Y/M/D when M/D would be read as another day. Always the date itself (not 今日 /
+ * 明日), so a line that waits past midnight keeps the day that was chosen. null for a date it cannot write.
+ */
+export function dueWord(ymd, today) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd || ''));
+  if (!m) return null;
+  const short = Number(m[2]) + '/' + Number(m[3]);
+  const word = parseDateWord(short, today) === ymd ? short : m[1] + '/' + Number(m[2]) + '/' + Number(m[3]);
+  return parseDateWord(word, today) === ymd ? word : null;
+}
+
+/**
+ * Where a button's word goes in the line (type: due / rank / duration): in place of the word read for that field, or
+ * at the end. raws: the new words; from[k]: where word k was before (-1 for the button's word); index: the button's word.
+ */
+export function placeFieldWord(tokens, type, word) {
+  const raws = tokens.map((t) => t.raw);
+  const from = raws.map((_, k) => k);
+  let index = tokens.findIndex((t) => t.type === type);
+  if (index >= 0) {
+    raws[index] = word;
+  } else {
+    index = raws.length;
+    raws.push(word);
+  }
+  from[index] = -1;
+  return { raws, from, index };
+}
+
+/** The line with one field chosen by a button: the word read for that field is replaced, or the word is added at the end. */
+export function withFieldWord(text, type, word, opts) {
+  return placeFieldWord(tokenize(text, opts), type, word).raws.join(' ');
 }
 
 /** Why this line cannot be added ('' when it can). */

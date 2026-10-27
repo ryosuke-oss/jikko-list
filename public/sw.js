@@ -4,7 +4,7 @@
 // VERSION and FILES are written by `npm run stamp`; tests/sw.test.js checks they are up to date,
 // so a changed file always comes with a new version (the new version replaces the old box).
 
-const VERSION = 'v1.4-2540baa4';
+const VERSION = 'v1.5-c4123736';
 const CACHE = 'jikko-list-' + VERSION;
 const FILES = [
   '/app-icon.svg',
